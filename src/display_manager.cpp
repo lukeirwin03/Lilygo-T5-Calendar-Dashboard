@@ -39,6 +39,43 @@ void fullRefresh() {
   epd_poweroff();
 }
 
+void partialRefresh(int x, int y, int w, int h) {
+  // The EPD driver expects contiguous packed-pixel data for the sub-region.
+  // Our framebuffer is row-major at EPD_WIDTH stride, so we must compact
+  // the sub-region bytes into a temporary buffer.
+  int rowBytes = w / 2;
+  int bufSize = rowBytes * h;
+  uint8_t* temp = (uint8_t*)ps_malloc(bufSize);
+  if (!temp) {
+    // Fallback to full refresh if allocation fails
+    fullRefresh();
+    return;
+  }
+
+  for (int row = 0; row < h; row++) {
+    memcpy(temp + row * rowBytes,
+           g_framebuffer + (y + row) * (EPD_WIDTH / 2) + x / 2,
+           rowBytes);
+  }
+
+  Rect_t area;
+  area.x = x;
+  area.y = y;
+  area.width = w;
+  area.height = h;
+
+  epd_poweron();
+  // Clear the area to white first — e-paper partial refresh doesn't fully
+  // transition pixels from gray to white, so gray compounds with each update.
+  // epd_clear_area does a proper clear cycle on just this sub-region (brief
+  // black-to-white flash), giving a clean slate before drawing new content.
+  epd_clear_area(area);
+  epd_draw_grayscale_image(area, temp);
+  epd_poweroff();
+
+  free(temp);
+}
+
 void drawSplash(const char* msg) {
   memset(g_framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
   int32_t cx = EPD_WIDTH / 2 - 100;

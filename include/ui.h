@@ -7,6 +7,7 @@ namespace ui {
 enum Screen {
   SCREEN_WEEKLY,
   SCREEN_DAILY,
+  SCREEN_SETTINGS,
   SCREEN_COUNT
 };
 
@@ -22,5 +23,12 @@ void updateTouch(bool isTouched, int16_t x, int16_t y);
 
 // Returns true once after a touch interaction changed the UI and needs a redraw.
 bool needsRender();
+
+// Refresh mode requested by the last interaction.
+// 0 = full refresh, 1 = partial refresh of the settings dirty rect.
+int refreshMode();
+
+// Populates the dirty rectangle for a partial settings refresh.
+void getSettingsDirtyRect(int& x, int& y, int& w, int& h);
 
 } // namespace ui

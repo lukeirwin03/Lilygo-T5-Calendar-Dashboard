@@ -43,6 +43,12 @@ namespace config {
   constexpr int BATTERY_SAMPLES   = 16;
   constexpr float BATTERY_DIVIDER = 2.0f;
 
+  // -- SD card (SPI) --
+  constexpr int SDCARD_MISO = 16;
+  constexpr int SDCARD_MOSI = 15;
+  constexpr int SDCARD_SCK  = 11;
+  constexpr int SDCARD_CS   = 42;
+
   // -- Time --
   constexpr const char* TIMEZONE      = "CST6CDT,M3.2.0/2,M11.1.0/2";
   constexpr const char* NTP_SERVER_1  = "pool.ntp.org";
