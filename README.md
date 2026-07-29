@@ -1,11 +1,6 @@
 # T5 Calendar Dashboard
 
-> **NOTE (July 2026):** The weekly view has been significantly redesigned
-> (focus+context layout, lane splitting, new typography, event compression).
-> The description below reflects the pre-redesign state.
-> See [`UI_REDESIGN.md`](UI_REDESIGN.md) for the current design and status.
-
-Firmware for a **LilyGo T5 4.7" e-paper (ESP32-S3)** that subscribes to a calendar MQTT topic and renders a **5-day weekly overview** plus a **full-screen daily detail view**. The device spends most of its time in deep sleep and wakes on a timer, a button press, or (with a hardware bridge) touch.
+Firmware for a **LilyGo T5 4.7" e-paper (ESP32-S3)** that subscribes to a calendar MQTT topic and renders a **focus+context weekly view** plus a **daily list/detail view** with touch navigation. The device spends most of its time in deep sleep and wakes on a timer, button press, or touch.
 
 ## Hardware
 
@@ -18,55 +13,84 @@ Firmware for a **LilyGo T5 4.7" e-paper (ESP32-S3)** that subscribes to a calend
 | User button    | GPIO 21 (active-low, RTC-capable)                     |
 | SD card pins   | MISO=16, MOSI=15, SCK=11, CS=42                       |
 
-All tunable pins and network settings live in [`include/config.h`](include/config.h). SD card pins are documented here but only used once Phase 6 caching is enabled.
+All pins and network constants live in [`include/config.h`](include/config.h).
 
-## What it does
+## Build environments
 
-The dashboard is a pure **MQTT subscriber** that receives a retained JSON calendar payload, parses it into days/events, and renders one of two views.
+| Env | Purpose | Entry point | WiFi/MQTT | SD card |
+| --- | ------- | ----------- | --------- | ------- |
+| `demo` | UI prototyping with hardcoded test events | `src/main.cpp` | No | No |
+| `dashboard` | Production firmware | `src/main_dashboard.cpp` | Yes | Yes |
 
-### Sleep/wake cycle
+```bash
+pio run -e demo -t upload          # flash demo (no WiFi needed)
+pio run -e dashboard -t upload     # flash production
+pio device monitor                 # 115200 baud serial monitor
+```
 
-1. **Cold boot** — connect WiFi, sync SNTP, connect MQTT, wait for retained payload, render.
-2. **Timer wake** — refresh WiFi/MQTT, render latest data, go back to sleep.
-3. **Button/touch wake** — replay the cached payload, stay awake for interaction, sleep after inactivity.
+## Views
 
-### Active hours
+### Weekly view (default)
 
-- **7 AM – 10 PM**: device stays awake for 5 minutes after user interaction, then sleeps for `SCHEDULED_INTERVAL_MS` (default 2 hours).
-- **10 PM – 7 AM**: device immediately deep-sleeps until 7 AM.
+A 3-column **focus+context** layout:
 
-### Views
+- **Left context** (~224px): chronological text list of the previous day's events (time range + title per row, alternating stripes)
+- **Focus column** (~448px, center): proportional event blocks on a **dynamic timeline** that snaps to a nice duration (3h, 6h, 9h, 12h, 18h, or 24h) based on the day's events
+- **Right context** (~224px): chronological text list of the next day's events
 
-#### Weekly overview (default)
+Focus column features:
+- Event blocks sized proportionally to duration, with lane splitting for overlapping events
+- Dynamic timeline range: 1 hour before earliest event to 1 hour after latest, snapped to the next nice duration
+- Boundary lines at the top and bottom show the time range (e.g., "8:00 AM" and "7:00 PM")
+- Two grid lines at 1/3 and 2/3 of the timeline
+- Faint gray fill in gaps between events (>60 min)
+- Time range shown at the top of each block (e.g., "2:00 - 6:00 PM")
+- All-day events shown in a black banner above the timeline
 
-Five day columns showing a proportional mini-timeline from **7 AM to 10 PM**:
+Context column features:
+- Ultra-compact 12-hour time ranges: "9:00-10:00AM" (same half) or "11:30A-1:00P" (crossing AM/PM)
+- Alternating LTGRAY/white row stripes
+- All-day banner at the top (if any)
 
-- Day name and large seven-segment day number at the top.
-- Timed events positioned by absolute clock time, with side-by-side lanes when they overlap.
-- Event blocks use spaced-apart grayscale shades (`{3, 7, 10, 13}`) and white-on-dark text.
-- All-day events collapsed into a bottom black banner; multiple events shown as `"EventA, EventB"` or `"EventA +2"`.
-- Tap a column to open that day in daily view.
-- Bottom-left/right arrows scroll to the previous/next week.
+### Daily view
 
-#### Daily detail view
+Single-day view with a tear-off calendar widget and event list:
 
-Full-screen view for a single day:
+- **Left column**: 220px tear-off calendar (day name + number) + "Back to Week" button
+- **Right column**: Compact 2-line event rows (time range + title, 60px each, alternating stripes)
+- **Tap any event row** → switches the right column to a **detail view** showing full event info (title, time range, location, description, calendar source) with a "← Back to list" button
+- Detail transitions use **partial refresh** (only the right column refreshes, ~2s instead of ~5s full refresh)
 
-- Header with back arrow, full date (e.g., `"Mon, Jun 15"`), and battery meter.
-- All-day banner across the top.
-- Scrolling list cards showing title, time range, location, description, calendar, and type.
-- Bottom arrows scroll by single day (wrapping across weeks at the edges).
-- Tap the back arrow to return to weekly view.
+### Navigation
 
-### Navigation summary
+| Action | Weekly view | Daily view |
+| ------ | ----------- | ---------- |
+| Tap left footer arrow | Previous day | Previous day |
+| Tap right footer arrow | Next day | Next day |
+| Tap "Today" button | Jump to today | Jump to today |
+| Tap left context column | Previous day | — |
+| Tap right context column | Next day | — |
+| Tap focus column | Open daily view | — |
+| Tap event row (daily) | — | Open event detail |
+| Tap "← Back to list" | — | Return to event list |
+| Tap "← Back to Week" | — | Return to weekly view |
+| Button press | Toggle daily/weekly | Toggle daily/weekly |
 
-| Gesture | Weekly view | Daily view |
-| ------- | ----------- | ---------- |
-| Tap left arrow | Previous week | Previous day |
-| Tap right arrow | Next week | Next day |
-| Tap column | Open daily view | — |
-| Tap back arrow | — | Return to weekly |
-| Button press | Toggle to daily | Toggle to weekly |
+### Settings (debug-gated)
+
+Settings are hidden by default. To access:
+1. **Long-press the battery icon** (≥2 seconds) → toggles debug mode
+2. When debug mode is on, **tap the battery icon** → opens settings screen
+3. Settings: day start/end hour, refresh interval, inactivity timeout, history retention
+4. Network settings (SSID, MQTT host) are displayed but not yet wired to the networking code
+
+## Sleep / wake cycle
+
+1. **Cold boot** — connect WiFi, sync SNTP, connect MQTT, wait for retained payload, render
+2. **Timer wake** — refresh WiFi/MQTT, render latest data, go back to sleep
+3. **Button/touch wake** — replay cached payload, stay awake for interaction, sleep after inactivity
+
+Active hours: **7 AM – 10 PM**. Outside these hours, the device sleeps immediately.
 
 ## MQTT model
 
@@ -84,7 +108,7 @@ publisher (cron/script/integration)
 
 **Topic:** `dashboard/calendar`
 
-The MQTT buffer is set to 4 KB in `networking.cpp`. The publisher **must** set `retain=true` so the broker hands the latest payload to the ESP32 immediately on connect.
+The MQTT buffer is 4 KB. The publisher **must** set `retain=true`.
 
 ### Payload schema
 
@@ -92,8 +116,6 @@ See [`example-payload.json`](example-payload.json):
 
 ```jsonc
 {
-  "updated": "2026-06-11T19:05:00Z",
-  "horizon_days": 7,
   "events": [
     {
       "title": "Summer Art Festival",
@@ -106,12 +128,12 @@ See [`example-payload.json`](example-payload.json):
       "type": "event"
     },
     {
-      "title": "Chiro @ 3:30",
+      "title": "Chiro",
       "start": "2026-06-15T15:30-05:00",
       "end": "2026-06-15T16:00-05:00",
       "all_day": false,
-      "location": "",
-      "description": "",
+      "location": "West Omaha Chiro",
+      "description": "Routine adjustment",
       "calendar": "main",
       "type": "event"
     }
@@ -119,111 +141,92 @@ See [`example-payload.json`](example-payload.json):
 }
 ```
 
-| Field | Meaning |
-| ----- | ------- |
-| `title` | Event/task title |
-| `start` / `end` | ISO datetime or date. Timezone offset is parsed but currently discarded (local time is assumed). |
-| `all_day` | `true` for all-day/multi-day events |
-| `location` | Optional location shown in daily list cards |
-| `description` | Optional description shown in daily list cards |
-| `calendar` | Source calendar name; drives the grayscale shade |
-| `type` | `"event"` or `"task"` (displayed as metadata) |
-
 Multi-day all-day events are expanded into one entry per calendar day.
-
-## Configuration
-
-All tunables live in [`include/config.h`](include/config.h).
-
-| Setting | Default | Purpose |
-| ------- | ------- | ------- |
-| `MQTT_HOST`, `MQTT_PORT` | `192.168.1.38`, `1883` | Broker address |
-| `MQTT_CLIENT_ID` | `t5-calendar-dashboard` | Client ID reported to broker |
-| `SCHEDULED_INTERVAL_MS` | `2 * 60 * 60 * 1000` | Timer-wake refresh interval |
-| `INACTIVITY_TIMEOUT_MS` | `5 * 60 * 1000` | Sleep after no touch/button activity |
-| `PAYLOAD_WAIT_MS` | `8000` | Max time to wait for retained payload |
-| `NTP_SYNC_TIMEOUT_MS` | `10000` | SNTP sync timeout on cold boot |
-| `BUTTON_PIN` | `21` | Physical wake/toggle button |
-| `TOUCH_INT_PIN` | `47` | GT911 IRQ (non-RTC) |
-| `TOUCH_WAKE_PIN` | `10` | RTC-capable GPIO for touch wake (requires GPIO47→GPIO10 bridge) |
-| `BATTERY_ADC_PIN` | `14` | Battery voltage divider |
-
-WiFi credentials and MQTT auth live in [`include/secrets.h`](include/secrets.h) (gitignored). Copy [`include/secrets.example.h`](include/secrets.example.h) → `include/secrets.h` and fill in your values before flashing.
 
 ## File layout
 
 ```
 project-root/
-├── platformio.ini
+├── platformio.ini              ← build config (demo + dashboard envs)
 ├── boards/
 │   └── T5-ePaper-S3.json
-├── example-payload.json       ← reference MQTT payload
-├── plan.md                    ← development plan / status
-├── README.md                  ← this file
+├── convert_fonts.sh            ← font pipeline (requires freetype-py)
+├── patch_font_renderer.py      ← pre-build script for font renderer patch
+├── example-payload.json        ← reference MQTT payload
+├── README.md
 ├── include/
-│   ├── config.h               ← tunables, pins, network
-│   ├── secrets.h              ← WiFi + MQTT credentials (gitignored)
-│   ├── secrets.example.h      ← template
-│   ├── dashboard.h            ← abstract Dashboard base class
+│   ├── config.h                ← pins, network constants, timing
+│   ├── secrets.h               ← WiFi + MQTT credentials (gitignored)
+│   ├── secrets.example.h       ← template
+│   ├── dashboard.h             ← abstract Dashboard base class
 │   ├── battery.h
-│   ├── display_manager.h
-│   ├── networking.h
-│   ├── power_mgr.h
-│   ├── touch_input.h
-│   ├── tinyfont.h             ← 5×7 bitmap font
+│   ├── display_manager.h       ← framebuffer, full/partial refresh
+│   ├── networking.h            ← WiFi, MQTT, RTC payload cache
+│   ├── power_mgr.h             ← deep sleep + wake reason
+│   ├── touch_input.h           ← GT911 touch driver
+│   ├── settings.h              ← runtime settings struct (SD card)
+│   ├── sd_storage.h            ← SD card: config + logs
+│   ├── ui.h                    ← UI namespace: render, touch, screens
+│   ├── ui_settings.h           ← settings screen API
+│   ├── dashboards/
+│   │   └── calendar_dashboard.h  ← event parsing
+│   └── fonts/                  ← generated GFXfont headers (Genty, MeltSwashes, Computer)
+├── src/
+│   ├── main.cpp                ← demo entry point (hardcoded test events)
+│   ├── main_dashboard.cpp      ← production entry point (MQTT, SD, sleep)
+│   ├── ui.cpp                  ← all rendering + touch state machine (~2000 lines)
+│   ├── ui_settings.cpp         ← settings screen rendering + touch
+│   ├── display_manager.cpp     ← PSRAM framebuffer, fullRefresh, partialRefresh
+│   ├── networking.cpp          ← WiFi + MQTT lifecycle, SNTP, RTC cache
+│   ├── power_mgr.cpp           ← wake reason detection, deep sleep
+│   ├── touch_input.cpp         ← GT911 I²C driver
+│   ├── battery.cpp             ← ADC sampling, LiPo curve
+│   ├── settings.cpp            ← settings load/save from SD card
+│   ├── sd_storage.cpp          ← SD card config + log management
 │   └── dashboards/
-│       └── calendar_dashboard.h
-└── src/
-    ├── main.cpp               ← entry point, wake routing, loop, sleep logic
-    ├── battery.cpp
-    ├── display_manager.cpp    ← framebuffer, power, refresh
-    ├── networking.cpp         ← WiFi, MQTT, RTC payload cache
-    ├── power_mgr.cpp          ← deep sleep + wake reason helpers
-    ├── touch_input.cpp        ← GT911 touch driver
-    ├── tinyfont.cpp           ← small font blitter
-    └── dashboards/
-        └── calendar_dashboard.cpp   ← parsing + weekly/daily rendering
+│       └── calendar_dashboard.cpp  ← JSON parsing, event expansion
+└── test/
+    ├── MANUAL_TESTS.md
+    ├── test_calendar/          ← event parsing unit tests
+    └── test_settings/          ← settings value cycle tests
 ```
 
 ### Module rundown
 
-- **`main.cpp`** — `setup()` branches on wake reason: cold boot pulls fresh data, timer wake refreshes and sleeps immediately, button/touch wake replays cached data and enters the interactive loop. `loop()` polls touch, handles the button, renders when dirty, and enforces the active-hours sleep schedule.
-- **`networking.cpp`** — WiFi + MQTT lifecycle, SNTP sync, `pumpForPayload()` for the retained message, and an RTC-RAM payload cache (`replayCachedPayload()`) so button/touch wakes do not need the radio.
-- **`dashboards/calendar_dashboard.cpp`** — parses the JSON events array, expands all-day events across days, sorts timed events, and renders the weekly overview or daily detail view.
-- **`display_manager.cpp`** — allocates the 4-bit grayscale framebuffer in PSRAM, initializes the panel, and provides `fullRefresh()` / `powerOn()` / `powerOff()`.
-- **`touch_input.cpp`** — initializes the GT911 over I²C, maps coordinates to the 960×540 panel, and puts the controller to sleep before deep sleep.
-- **`battery.cpp`** — samples the battery voltage divider and maps it to a 0–100% estimate stored in RTC RAM.
-- **`power_mgr.cpp`** — detects wake reason and configures timer + `ext1` button wake (touch wake is disabled by default because GPIO47 is not RTC-capable).
+- **`ui.cpp`** — All rendering (weekly focus+context, daily list/detail) and the touch state machine. Manages screen state, navigation, partial refresh coordination, and the dynamic timeline.
+- **`ui_settings.cpp`** — Settings screen with sidebar navigation, value cycling, and partial refresh for row updates.
+- **`main.cpp`** / **`main_dashboard.cpp`** — Entry points for demo and production. Handle wake routing, touch polling, render scheduling, and sleep logic.
+- **`display_manager.cpp`** — PSRAM framebuffer allocation, full refresh, partial refresh (with full-width draw to avoid EPD edge ghosting).
+- **`networking.cpp`** — WiFi/MQTT lifecycle, SNTP time sync, RTC-RAM payload cache for offline wake.
+- **`dashboards/calendar_dashboard.cpp`** — JSON event parsing, all-day event expansion, shade assignment. Does NOT render (rendering is in `ui.cpp`).
+- **`settings.cpp`** — Runtime settings struct loaded from `/config/settings.json` on SD card.
+- **`sd_storage.cpp`** — SD card mount, config file read/write, log management with retention cleanup.
 
-## Build & flash
+## Configuration
+
+WiFi credentials and MQTT auth live in [`include/secrets.h`](include/secrets.example.h) (gitignored). Copy `secrets.example.h` → `secrets.h` and fill in values before flashing the dashboard env.
+
+Runtime settings (display hours, refresh interval, etc.) are stored on the SD card at `/config/settings.json` and edited through the settings UI.
+
+## Font pipeline
+
+Fonts are generated from `.ttf` files using `convert_fonts.sh`, which requires `freetype-py` (install in a virtualenv):
 
 ```bash
-pio run                    # compile
-pio run -t upload          # compile + flash
-pio device monitor         # 115200 baud serial monitor
+python -m venv .venv
+source .venv/bin/activate
+pip install freetype-py
+./convert_fonts.sh
 ```
 
-`platformio.ini` pins the upload/monitor port to **COM8**; change it if your machine assigns a different port. If sprites or fonts look stale after a layout change, run `pio run -t clean` first.
-
-## Diagnostics
-
-Serial output at 115200 baud shows:
-
-- Boot info — wake reason, free heap, PSRAM, flash size, RTC time
-- WiFi connection details and RSSI
-- MQTT connection state, subscribe status, payload previews
-- Parsed event/day summary
-- Render events and sleep decisions
-- Periodic heartbeat with free heap and connection status
-
-## Roadmap / current status
-
-See [`plan.md`](plan.md) for the full development plan. As of the latest commit:
-
-- ✅ Phases 1–5 complete (hardware boot, MQTT, parsing, dual views, touch/button nav, sleep schedule)
-- ⬜ Phase 6 in progress — SD card caching for offline cold-boot support
+The pipeline generates GFXfont headers for:
+- **Genty** (24pt, 32pt, 48pt) — decorative headings, day numbers
+- **MeltSwashes** (14pt, 16pt, 18pt) — body text, time labels
+- **Computer** (14pt, 16pt, 20pt) — monospace (available but not currently used in rendering)
 
 ## Notes
 
-- The panel keeps its last rendered image with zero current draw, so the screen stays visible between deep sleeps.
-- Touch wake requires a hardware bridge from `TOUCH_INT_PIN` (GPIO47) to `TOUCH_WAKE_PIN` (GPIO10) because GPIO47 is not RTC-capable on the ESP32-S3. Until that bridge is installed, only the button can wake the device from deep sleep.
+- The panel retains its last image with zero current draw between deep sleeps.
+- Touch wake from deep sleep requires a hardware bridge from GPIO47 (TOUCH_INT) to GPIO10 (TOUCH_WAKE_PIN) because GPIO47 is not RTC-capable. Without the bridge, only the button can wake from deep sleep.
+- The demo environment includes touch diagnostics (heartbeat, init-failure logging) and 26 hardcoded test events covering edge cases (overlaps, gaps, all-day, cross-midnight, long titles).
+- Partial refresh is used for daily list↔detail transitions to avoid full-screen flashing. The technique draws at full width but clears only the sub-region to prevent EPD edge ghosting.
