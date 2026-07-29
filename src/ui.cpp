@@ -1,17 +1,14 @@
 #include "ui.h"
 #include "dashboards/calendar_dashboard.h"
 #include "display_manager.h"
-#include "battery.h"
 #include "epd_driver.h"
 #include "fonts/Genty24pt7b.h"
 #include "fonts/Genty32pt7b.h"
 #include "fonts/MeltSwashes14pt7b.h"
 #include "fonts/MeltSwashes16pt7b.h"
 #include "fonts/MeltSwashes18pt7b.h"
-#ifndef ENV_DEMO
 #include "ui_settings.h"
 #include "settings.h"
-#endif
 #include <Arduino.h>
 #include <time.h>
 #include <string.h>
@@ -39,8 +36,6 @@ static constexpr uint8_t EPD_WHITE  = C_WHITE  << 4;
 // ---------------------------------------------------------------------------
 static constexpr int WIN_MARGIN     = 12;
 static constexpr int HEADER_H       = 90;
-static constexpr int DAY_START_HOUR = 7;
-static constexpr int DAY_END_HOUR   = 22;
 
 static constexpr int EVENT_GAP = 4;  // px of white space between adjacent event blocks
 
@@ -51,16 +46,18 @@ static constexpr int SHORT_EVENT_MIN_H     = 28;   // px; 1-line block min heigh
 static constexpr int SHORT_EVENT_MAX_H     = 50;   // px; 1-line block max height (at 60 min)
 static constexpr int LONG_EVENT_CAP_MIN    = 480;  // min; events longer than this (8hr) plateau — likely all-day anyway
 
-// Daily view layout — shared between renderDailyView() and hitBackButton()
-// to prevent coordinate mismatches.
+// Daily view layout — shared between renderDailyView() and the daily nav
+// hit-tests to prevent coordinate mismatches.
 static constexpr int DAILY_PAGE_SIZE    = 220;  // tear-off calendar square (was 280)
 static constexpr int DAILY_PAGE_MARGIN  = 16;   // offset from content rect
-static constexpr int DAILY_BACK_W       = 220;  // back button width (was 280, matches page)
-static constexpr int DAILY_BACK_H       = 40;   // back button height (was 48)
-static constexpr int DAILY_BACK_GAP     = 12;   // gap between calendar and back button
+static constexpr int DAILY_BACK_GAP     = 24;   // gap between calendar and nav container
 static constexpr int DAILY_LIST_GAP     = 24;   // gap between calendar column and list
 static constexpr int DAILY_ROW_H        = 60;   // compact 2-line row (was 100)
 static constexpr int DAILY_STATUS_H     = 32;   // status strip height
+
+static constexpr int DAILY_NAV_W        = 220;  // container width (matches calendar & old back button)
+static constexpr int DAILY_NAV_BACK_H   = 64;   // "Back to Week" row height
+static constexpr int DAILY_NAV_ARROW_H  = 64;   // prev/next arrow row height
 
 // ---------------------------------------------------------------------------
 // External data source
@@ -109,12 +106,6 @@ static unsigned long s_cooldownUntilMs = 0;
 static bool          s_awaitingRelease = false;
 static unsigned long s_awaitingReleaseMs = 0;
 
-// Debug mode unlocks the Settings screen. Persisted across deep sleep so the
-// user only has to enable it once. Toggled by long-pressing the battery icon.
-#ifndef ENV_DEMO
-RTC_DATA_ATTR static bool s_debugMode = false;
-#endif
-
 static constexpr unsigned long TAP_MAX_MS         = 500;
 static constexpr int           SWIPE_MIN_PX       = 40;
 static constexpr unsigned long GESTURE_COOLDOWN_MS = 300;
@@ -147,22 +138,12 @@ static bool isTodayColumn(int colIdx) {
   return (s_baseDayOffset + (colIdx - 1)) == 0;
 }
 
-// Resolve display settings from the runtime settings struct when available,
-// otherwise fall back to compile-time defaults. The demo env excludes
-// settings.cpp so we use the constexpr fallbacks there.
+// Resolve the timeline bounds from the persisted user settings.
 static int resolvedDayStartHour() {
-#ifndef ENV_DEMO
   return settings::get().day_start_hour;
-#else
-  return DAY_START_HOUR;
-#endif
 }
 static int resolvedDayEndHour() {
-#ifndef ENV_DEMO
   return settings::get().day_end_hour;
-#else
-  return DAY_END_HOUR;
-#endif
 }
 
 // Format a struct tm as "YYYY-MM-DD"
@@ -198,6 +179,10 @@ static bool hasAllDayEventOnDate(const char* dateStr, const char* title) {
 
 static void formatTime(int hour, int min, char* buf, size_t len) {
   hour = hour % 24;
+  if (settings::get().time_format_24h) {
+    snprintf(buf, len, "%02d:%02d", hour, min);
+    return;
+  }
   int h = hour % 12;
   if (h == 0) h = 12;
   const char* ampm = (hour < 12) ? "AM" : "PM";
@@ -208,6 +193,10 @@ static void formatTime(int hour, int min, char* buf, size_t len) {
 // 1-line short-event format where horizontal space is at a premium.
 static void formatTimeCompact(int hour, int min, char* buf, size_t len) {
   hour = hour % 24;
+  if (settings::get().time_format_24h) {
+    snprintf(buf, len, "%02d:%02d", hour, min);
+    return;
+  }
   int h = hour % 12;
   if (h == 0) h = 12;
   const char* ampm = (hour < 12) ? "AM" : "PM";
@@ -221,6 +210,10 @@ static void formatTimeRangeUltraCompact(int startHour, int startMin, int duratio
   int endTotal = startHour * 60 + startMin + durationMin;
   int eh = (endTotal / 60) % 24;
   int em = endTotal % 60;
+  if (settings::get().time_format_24h) {
+    snprintf(buf, len, "%02d:%02d-%02d:%02d", startHour % 24, startMin, eh, em);
+    return;
+  }
   int sh12 = startHour % 12;  if (sh12 == 0) sh12 = 12;
   int eh12 = eh % 12;          if (eh12 == 0) eh12 = 12;
   const char* sap = (startHour < 12) ? "AM" : "PM";
@@ -244,6 +237,10 @@ static void formatTimeRange(int startHour, int startMin, int durationMin,
   int endTotal = startTotal + durationMin;
   int eh = (endTotal / 60) % 24;
   int em = endTotal % 60;
+  if (settings::get().time_format_24h) {
+    snprintf(buf, len, "%02d:%02d - %02d:%02d", startHour % 24, startMin, eh, em);
+    return;
+  }
 
   // 12-hour conversions
   int sh12 = startHour % 12;  if (sh12 == 0) sh12 = 12;
@@ -688,29 +685,7 @@ static void drawTextWithOutline(GFXfont* font, const char* str, int x, int y,
 // ---------------------------------------------------------------------------
 // UI chrome
 // ---------------------------------------------------------------------------
-static void drawBatteryIcon(int x, int y, int w, int h, int percent, uint8_t* fb) {
-  epd_fill_rect(x, y, w, h, EPD_WHITE, fb);
-  epd_draw_rect(x, y, w, h, EPD_BLACK, fb);
-  epd_fill_rect(x + w, y + h / 4, 4, h / 2, EPD_BLACK, fb);
-
-  int segW = (w - 6) / 4;
-  int activeSegs = (percent <= 0)  ? 0 :
-                   (percent <= 25) ? 1 :
-                   (percent <= 50) ? 2 :
-                   (percent <= 75) ? 3 : 4;
-  for (int i = 0; i < 4; i++) {
-    int sx = x + 3 + i * segW;
-    if (i < activeSegs) {
-      epd_fill_rect(sx + 1, y + 3, segW - 2, h - 6, EPD_BLACK, fb);
-    } else {
-      epd_draw_rect(sx + 1, y + 3, segW - 2, h - 6, EPD_BLACK, fb);
-    }
-  }
-}
-
 static void drawArrowButton(int x, int y, int w, int h, bool left, uint8_t* fb) {
-  epd_fill_rect(x, y, w, h, EPD_WHITE, fb);
-  epd_draw_rect(x, y, w, h, EPD_BLACK, fb);
 
   int cx = x + w / 2;
   int cy = y + h / 2;
@@ -780,39 +755,6 @@ static void getContentRect(int& cx, int& cy, int& cw, int& ch) {
   ch = winH - HEADER_H - WIN_MARGIN * 2 + 24;   // reclaim the 8 px from top + 4 px from the now-unnecessary top inset
 }
 
-static int getHeaderY() {
-  int winX, winY, winW, winH;
-  getWindowRect(winX, winY, winW, winH);
-  return winY + winH - WIN_MARGIN / 2 - HEADER_H + 12;
-}
-
-// Left footer section: under the left context column.
-static void getLeftFooterRect(int& lx, int& ly, int& lw, int& lh) {
-  int cx, cy, cw, ch;
-  getContentRect(cx, cy, cw, ch);
-  constexpr int COL_GAP = 8;
-  int contextW = (cw - COL_GAP * 2) / 4;
-
-  lx = cx;
-  ly = getHeaderY();
-  lw = contextW;
-  lh = HEADER_H;
-}
-
-// Right footer section: under the right context column.
-static void getRightFooterRect(int& rx, int& ry, int& rw, int& rh) {
-  int cx, cy, cw, ch;
-  getContentRect(cx, cy, cw, ch);
-  constexpr int COL_GAP = 8;
-  int contextW = (cw - COL_GAP * 2) / 4;
-  int focusW = contextW * 2;
-
-  rx = cx + contextW + COL_GAP + focusW + COL_GAP;
-  ry = getHeaderY();
-  rw = contextW;
-  rh = HEADER_H;
-}
-
 // ---------------------------------------------------------------------------
 // Touch handling — single poll-driven state machine
 // ---------------------------------------------------------------------------
@@ -834,103 +776,46 @@ static void triggerNav(int days) {
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
 }
 
-static void enterSettings() {
-  s_prevScreen = s_screen;
-  s_screen = SCREEN_SETTINGS;
+static void triggerScreenChange(Screen next, int dayOffset) {
+  s_screen = next;
+  s_baseDayOffset = dayOffset;
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
 }
 
-static void triggerScreenChange(Screen next, int dayOffset) {
-  s_screen = next;
-  s_baseDayOffset = dayOffset;
-  s_pendingRender = true;
-  s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-}
-
-// Hit test for an arrow in the split footer.
-// `left` = true for back arrow (in left footer), false for forward arrow (in right footer).
-static bool hitFooterArrow(int16_t x, int16_t y, bool left) {
-  int arrowSize = 60;
-  if (left) {
-    int lx, ly, lw, lh;
-    getLeftFooterRect(lx, ly, lw, lh);
-    int arrowX = lx + 12;
-    int arrowY = ly + (lh - arrowSize) / 2;
-    return (x >= arrowX && x <= arrowX + arrowSize &&
-            y >= arrowY && y <= arrowY + arrowSize);
-  } else {
-    int rx, ry, rw, rh;
-    getRightFooterRect(rx, ry, rw, rh);
-    int arrowX = rx + rw - 12 - arrowSize;
-    int arrowY = ry + (rh - arrowSize) / 2;
-    return (x >= arrowX && x <= arrowX + arrowSize &&
-            y >= arrowY && y <= arrowY + arrowSize);
-  }
-}
-
-// Hit test for the "Today" button in the left footer.
-static bool hitTodayButton(int16_t x, int16_t y) {
-  int lx, ly, lw, lh;
-  getLeftFooterRect(lx, ly, lw, lh);
-
-  // Compute the same geometry as drawLeftFooter()
-  const char* todayLabel = "Today";
-  int32_t tw = 0, th = 0, tx1 = 0, ty1 = 0;
-  int32_t tmcx = 0, tmcy = 0;
-  get_text_bounds((GFXfont*)&MeltSwashes18, todayLabel, &tmcx, &tmcy, &tx1, &ty1, &tw, &th, NULL);
-  int btnX = lx + lw - 12 - tw - 16;   // 12 px right padding, 16 px inner padding
-  int btnY = ly + (lh - 32) / 2;       // 32 px tall button, vertically centered
-  int btnW = tw + 32;
-  int btnH = 32;
-  return (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH);
-}
-
-// Returns true if (x, y) is inside EITHER footer section (left or right).
-static bool inHeader(int16_t x, int16_t y) {
-  int lx, ly, lw, lh;
-  getLeftFooterRect(lx, ly, lw, lh);
-  if (x >= lx && x <= lx + lw && y >= ly && y <= ly + lh) return true;
-  int rx, ry, rw, rh;
-  getRightFooterRect(rx, ry, rw, rh);
-  return (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh);
-}
-
-// Battery icon rect, matching drawRightFooter(). Used for both the existing
-// tap-target and the long-press-to-enable-debug gesture.
-static bool hitBatteryIcon(int16_t x, int16_t y) {
-  int rx, ry, rw, rh;
-  getRightFooterRect(rx, ry, rw, rh);
-  int batW = 48, batH = 24;
-  int batX = rx + 12;
-  int batY = ry + (rh - batH) / 2;
-  return (x >= batX && x <= batX + batW && y >= batY && y <= batY + batH);
-}
-
-// Gear icon rect, shared between drawRightFooter() and the gear hit-test
-// in classifyGesture(). Single source of truth so the tap target always
-// matches the drawn icon.
-static void getGearRect(int& gearX, int& gearY) {
-  int rx, ry, rw, rh;
-  getRightFooterRect(rx, ry, rw, rh);
-  int batW = 48;
-  int batX = rx + 12;
-  gearX = batX + batW + 20;
-  gearY = ry + (rh - 16) / 2;
-}
-
-static bool hitBackButton(int16_t x, int16_t y) {
-  if (s_screen != SCREEN_DAILY) return false;
+// Container sits in the left column, directly below the tear-off calendar.
+static void getDailyNavRect(int& nx, int& ny, int& nw, int& nh) {
   int cx, cy, cw, ch;
   getContentRect(cx, cy, cw, ch);
-
-  // Content starts below the status strip — must match renderDailyView()
   int contentTop = cy + DAILY_STATUS_H + 8;
   int pageX = cx + DAILY_PAGE_MARGIN;
-  int bx = pageX;
-  int by = contentTop + DAILY_PAGE_SIZE + DAILY_BACK_GAP;
-  return x >= bx && x <= bx + DAILY_BACK_W && y >= by && y <= by + DAILY_BACK_H;
+  int pageY = contentTop;
+  nx = pageX;
+  ny = pageY + DAILY_PAGE_SIZE + DAILY_BACK_GAP;
+  nw = DAILY_NAV_W;
+  nh = DAILY_NAV_BACK_H + DAILY_NAV_ARROW_H;
+}
+
+static bool hitDailyBackToWeek(int16_t x, int16_t y) {
+  if (s_screen != SCREEN_DAILY) return false;
+  int nx, ny, nw, nh;
+  getDailyNavRect(nx, ny, nw, nh);
+  return (x >= nx && x <= nx + nw && y >= ny && y <= ny + DAILY_NAV_BACK_H);
+}
+static bool hitDailyPrev(int16_t x, int16_t y) {
+  if (s_screen != SCREEN_DAILY) return false;
+  int nx, ny, nw, nh;
+  getDailyNavRect(nx, ny, nw, nh);
+  int arrowTop = ny + DAILY_NAV_BACK_H;
+  return (x >= nx && x < nx + nw / 2 && y >= arrowTop && y <= ny + nh);
+}
+static bool hitDailyNext(int16_t x, int16_t y) {
+  if (s_screen != SCREEN_DAILY) return false;
+  int nx, ny, nw, nh;
+  getDailyNavRect(nx, ny, nw, nh);
+  int arrowTop = ny + DAILY_NAV_BACK_H;
+  return (x >= nx + nw / 2 && x <= nx + nw && y >= arrowTop && y <= ny + nh);
 }
 
 // Shared geometry for the daily event list right column. Used by both
@@ -942,7 +827,7 @@ static void getDailyListRect(int& listX, int& listY, int& listW, int& listH) {
   listX = cx + DAILY_PAGE_MARGIN + DAILY_PAGE_SIZE + DAILY_LIST_GAP;
   listY = contentTop;
   listW = cx + cw - DAILY_PAGE_MARGIN - listX;
-  listH = ch - (contentTop - cy) - 8;
+  listH = (EPD_HEIGHT - 4) - listY - 4;
 }
 
 // Hit test for event row taps in the daily list. Returns the global event
@@ -983,26 +868,28 @@ static void classifyGesture() {
     return;
   }
 
-  // Hidden gesture: long-press the battery icon to toggle debug mode.
-  // Debug mode reveals the gear icon / Settings screen.
-#ifndef ENV_DEMO
-  if (dur >= 2000 && hitBatteryIcon(s_startX, s_startY)) {
-    s_debugMode = !s_debugMode;
-    s_pendingRender = true;
-    s_refreshMode = REFRESH_FULL;
-    s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-    return;
-  }
-#endif
-
   if (dur > TAP_MAX_MS) {
     return;
   }
 
-  // Daily view: event row tap or detail back button
   if (s_screen == SCREEN_DAILY) {
+    // Container nav (works in both list and detail mode)
+    if (hitDailyBackToWeek(s_startX, s_startY)) {
+      s_selectedEventIdx = -1;
+      triggerScreenChange(SCREEN_WEEKLY, s_baseDayOffset);
+      return;
+    }
+    if (hitDailyPrev(s_startX, s_startY)) {
+      triggerNav(-1);
+      return;
+    }
+    if (hitDailyNext(s_startX, s_startY)) {
+      triggerNav(+1);
+      return;
+    }
+
     if (s_selectedEventIdx >= 0) {
-      // Detail mode — check for "← Back to list" button
+      // Detail mode — "Back to list" button
       if (hitDailyDetailBack(s_startX, s_startY)) {
         s_selectedEventIdx = -1;
         s_pendingRender = true;
@@ -1011,7 +898,7 @@ static void classifyGesture() {
         return;
       }
     } else {
-      // List mode — check for event row tap
+      // List mode — tap an event row to open detail
       int eventIdx = hitDailyEventRow(s_startX, s_startY);
       if (eventIdx >= 0) {
         s_selectedEventIdx = eventIdx;
@@ -1025,63 +912,11 @@ static void classifyGesture() {
     }
   }
 
-  // Back button on daily view
-  if (s_screen == SCREEN_DAILY && hitBackButton(s_startX, s_startY)) {
-    s_selectedEventIdx = -1;
-    triggerScreenChange(SCREEN_WEEKLY, s_baseDayOffset);
-    return;
-  }
-
-  // When debug mode is on, a normal tap on the battery icon opens Settings.
-#ifndef ENV_DEMO
-  if (s_debugMode && hitBatteryIcon(s_startX, s_startY)) {
-    enterSettings();
-    return;
-  }
-#endif
-
-  // Footer arrow taps and Today button
-  if (inHeader(s_startX, s_startY)) {
-    if (hitFooterArrow(s_startX, s_startY, true)) {
-      triggerNav(-1);
-      return;
-    }
-    if (hitFooterArrow(s_startX, s_startY, false)) {
-      triggerNav(+1);
-      return;
-    }
-    // Today button (left footer) — reset focus to today.
-    if (hitTodayButton(s_startX, s_startY)) {
-      s_baseDayOffset = 0;
-      s_pendingRender = true;
-      s_refreshMode = REFRESH_FULL;
-      s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-      return;
-    }
-    // Gear icon (right footer, between battery and arrow)
-    int gearX, gearY;
-    getGearRect(gearX, gearY);
-    // Hit target is the 16x16 drawn icon plus 2px padding on each side
-    // for a forgiving tap zone.
-    if (s_startX >= gearX - 2 && s_startX <= gearX + 18 &&
-        s_startY >= gearY - 2 && s_startY <= gearY + 18) {
-#ifndef ENV_DEMO
-      if (s_debugMode) {
-        enterSettings();
-        return;
-      }
-#endif
-    }
-
-    // Tapped in footer but not on a button
-    return;
-  }
-
   // Weekly column tap → open daily view
-  if (s_screen == SCREEN_WEEKLY && !inHeader(s_startX, s_startY)) {
+  if (s_screen == SCREEN_WEEKLY) {
     int cx, cy, cw, ch;
     getContentRect(cx, cy, cw, ch);
-    if (s_startY >= cy && s_startY <= cy + ch &&
+    if (s_startY >= cy && s_startY <= EPD_HEIGHT - 4 &&
         s_startX >= cx && s_startX <= cx + cw) {
       // focus+context layout has variable column widths.
       // Reconstruct the column index from x position.
@@ -1121,7 +956,6 @@ static void classifyGesture() {
 // x, y: valid only when isTouched is true.
 void updateTouch(bool isTouched, int16_t x, int16_t y) {
   // Settings screen handles taps directly, not via the gesture state machine
-#ifndef ENV_DEMO
   if (s_screen == SCREEN_SETTINGS) {
     if (isTouched && !s_wasSettingsTouched) {
       ui_settings::TapResult result = ui_settings::handleTap(x, y);
@@ -1130,9 +964,15 @@ void updateTouch(bool isTouched, int16_t x, int16_t y) {
         s_pendingRender = true;
         s_refreshMode = REFRESH_FULL;
         s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
+        // The closing tap leaves a finger on the panel. Gate further input
+        // until it lifts so it isn't classified as a spurious weekly/daily
+        // gesture now that we've left the settings screen.
+        s_awaitingRelease = true;
+        s_awaitingReleaseMs = millis();
+        s_phase = TOUCH_IDLE;
       } else if (result == ui_settings::TAP_FULL) {
         s_pendingRender = true;
-        s_refreshMode = REFRESH_FULL;
+        s_refreshMode = REFRESH_PARTIAL_SETTINGS;
       } else if (result == ui_settings::TAP_PARTIAL) {
         s_pendingRender = true;
         s_refreshMode = REFRESH_PARTIAL_SETTINGS;
@@ -1141,7 +981,6 @@ void updateTouch(bool isTouched, int16_t x, int16_t y) {
     s_wasSettingsTouched = isTouched;
     return;
   }
-#endif
 
   // Release gate: after a gesture, wait for the finger to be confirmed lifted
   // before accepting new touches. This prevents stale GT911 data (buffered
@@ -1199,9 +1038,7 @@ int refreshMode() {
 }
 
 void getSettingsDirtyRect(int& x, int& y, int& w, int& h) {
-#ifndef ENV_DEMO
   ui_settings::getDirtyRect(x, y, w, h);
-#endif
 }
 
 void getDailyDirtyRect(int& x, int& y, int& w, int& h) {
@@ -1213,84 +1050,6 @@ void getDailyDirtyRect(int& x, int& y, int& w, int& h) {
   y = listY - 4;
   w = listW + 8;    // 4px each side
   h = listH + 4;    // 4px top only
-}
-
-// ---------------------------------------------------------------------------
-// Split footer drawing
-// ---------------------------------------------------------------------------
-static void drawLeftFooter(uint8_t* fb) {
-  int lx, ly, lw, lh;
-  getLeftFooterRect(lx, ly, lw, lh);
-
-  // Striped background (matches the old footer style for visual continuity).
-  epd_fill_rect(lx + 1, ly, lw - 2, lh, EPD_LTGRAY, fb);
-  for (int i = 0; i < lh; i += 2) {
-    epd_draw_hline(lx + 1, ly + i, lw - 2, EPD_WHITE, fb);
-  }
-  epd_draw_rect(lx + 1, ly, lw - 2, lh, EPD_BLACK, fb);
-
-  // Back arrow (left side of the left footer)
-  int arrowSize = 60;
-  int arrowX = lx + 12;
-  int arrowY = ly + (lh - arrowSize) / 2;
-  drawArrowButton(arrowX, arrowY, arrowSize, arrowSize, true, fb);
-
-  // "Today" button (right side of the left footer) — small text label
-  const char* todayLabel = "Today";
-  int32_t tw = 0, th = 0, tx1 = 0, ty1 = 0;
-  int32_t tmcx = 0, tmcy = 0;
-  get_text_bounds((GFXfont*)&MeltSwashes18, todayLabel, &tmcx, &tmcy, &tx1, &ty1, &tw, &th, NULL);
-  int btnX = lx + lw - 12 - tw - 16;   // 12 px right padding, 16 px inner padding
-  int btnY = ly + (lh - 32) / 2;       // 32 px tall button, vertically centered
-  int btnW = tw + 32;
-  int btnH = 32;
-  epd_fill_rect(btnX, btnY, btnW, btnH, EPD_DKGRAY, fb);
-  epd_draw_rect(btnX, btnY, btnW, btnH, EPD_BLACK, fb);
-  // Center the text inside the button
-  int32_t tx = btnX + 16, tby = btnY + btnH / 2 + th / 2;
-  FontProperties props;
-  props.fg_color = C_WHITE;
-  props.bg_color = C_DKGRAY;
-  props.flags = 0;
-  props.fallback_glyph = 0;
-  write_mode((GFXfont*)&MeltSwashes18, todayLabel, &tx, &tby, fb, BLACK_ON_WHITE, &props);
-}
-
-static void drawRightFooter(uint8_t* fb) {
-  int rx, ry, rw, rh;
-  getRightFooterRect(rx, ry, rw, rh);
-
-  // Striped background.
-  epd_fill_rect(rx + 1, ry, rw - 2, rh, EPD_LTGRAY, fb);
-  for (int i = 0; i < rh; i += 2) {
-    epd_draw_hline(rx + 1, ry + i, rw - 2, EPD_WHITE, fb);
-  }
-  epd_draw_rect(rx + 1, ry, rw - 2, rh, EPD_BLACK, fb);
-
-  // Forward arrow (right side of the right footer)
-  int arrowSize = 60;
-  int arrowX = rx + rw - 12 - arrowSize;
-  int arrowY = ry + (rh - arrowSize) / 2;
-  drawArrowButton(arrowX, arrowY, arrowSize, arrowSize, false, fb);
-
-  // Battery icon (left side of the right footer)
-  int batW = 48, batH = 24;
-  int batX = rx + 12;
-  int batY = ry + (rh - batH) / 2;
-  int batPercent = battery::lastPercent();
-  if (batPercent < 0) batPercent = 0;
-  drawBatteryIcon(batX, batY, batW, batH, batPercent, fb);
-
-  // Gear icon (only in debug mode, between battery and arrow).
-#ifndef ENV_DEMO
-  if (s_debugMode) {
-    int gearX = batX + batW + 20;
-    int gearY = ry + (rh - 16) / 2;
-    epd_draw_circle(gearX + 8, gearY + 8, 8, EPD_BLACK, fb);
-    epd_fill_rect(gearX + 6, gearY - 2, 4, 4, EPD_BLACK, fb);
-    epd_draw_circle(gearX + 8, gearY + 8, 3, EPD_BLACK, fb);
-  }
-#endif
 }
 
 // Lane assignment for an event in a column. `lane` is the index of the lane
@@ -1385,6 +1144,7 @@ static void renderWeeklyView() {
 
   int cx, cy, cw, ch;
   getContentRect(cx, cy, cw, ch);
+  const int weeklyCh = (EPD_HEIGHT - 4) - cy;   // footer is gone — columns fill to the bottom
 
   constexpr int numCols = 3;  // Phase 10: focus + 2 context columns
   const int dayStartHour = resolvedDayStartHour();
@@ -1406,7 +1166,7 @@ static void renderWeeklyView() {
   int headerH = 56;
   int timelineTop = cy + headerH + 4;
   // Shared timeline geometry — same across all columns so grid lines align.
-  int timelineH = ch - headerH - 8;  // 8 = 4 px top gap + 4 px bottom padding
+  int timelineH = weeklyCh - headerH - 8;  // 8 = 4 px top gap + 4 px bottom padding
 
   for (int i = 0; i < numCols; i++) {
     struct tm day = base;
@@ -1429,10 +1189,8 @@ static void renderWeeklyView() {
     bool isFocus = (i == 1);
     bool isToday = isTodayColumn(i);  // today's offset is 0
 
-    // Focus column extends to the bottom of the screen; context columns stop
-    // above the split footer. The timeline itself uses the same height everywhere
-    // so grid lines align horizontally; focus just has empty space below it.
-    int effectiveCh = isFocus ? ((EPD_HEIGHT - 4) - cy) : ch;
+    // Footer is gone — every column now extends to the bottom of the screen.
+    int effectiveCh = weeklyCh;
 
     epd_draw_rect(x, cy, colW, effectiveCh, EPD_BLACK, fb);
 
@@ -1840,9 +1598,6 @@ static void renderWeeklyView() {
     }
 
   }
-
-  drawLeftFooter(fb);
-  drawRightFooter(fb);
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,6 +1606,48 @@ static void renderWeeklyView() {
 static int eventSortKey(const CalendarEvent& ev) {
   if (ev.allDay) return -1;
   return ev.startHour * 60 + ev.startMin;
+}
+
+static void drawDailyNav(uint8_t* fb) {
+  int nx, ny, nw, nh;
+  getDailyNavRect(nx, ny, nw, nh);
+
+  // Outer border
+  epd_draw_rect(nx, ny, nw, nh, EPD_BLACK, fb);
+
+  // "Back to Week" (top row)
+  epd_fill_rect(nx, ny, nw, DAILY_NAV_BACK_H, EPD_WHITE, fb);
+  epd_draw_rect(nx, ny, nw, DAILY_NAV_BACK_H, EPD_BLACK, fb);
+  {
+    const char* s = "Return";
+    int32_t tw = measureTextWidth((GFXfont*)&MeltSwashes18, s);
+    int32_t tx = nx + (nw - tw) / 2;
+    int32_t ty = ny + 42;
+    writeln((GFXfont*)&MeltSwashes18, s, &tx, &ty, fb);
+  }
+
+  // Horizontal divider between the two rows
+  epd_draw_hline(nx, ny + DAILY_NAV_BACK_H, nw, EPD_BLACK, fb);
+  // Vertical divider between the two arrow halves
+  epd_draw_vline(nx + nw / 2, ny + DAILY_NAV_BACK_H, DAILY_NAV_ARROW_H, EPD_BLACK, fb);
+
+  // Prev / Next arrows (reuse drawArrowButton). Each half is nw/2 wide.
+  int arrowSize = 44;
+  int arrowRowY = ny + DAILY_NAV_BACK_H;
+  // Left half (prev)
+  {
+    int hx = nx;
+    int cxArrow = hx + nw / 4;
+    int cyArrow = arrowRowY + (DAILY_NAV_ARROW_H - arrowSize) / 2;
+    drawArrowButton(cxArrow - arrowSize / 2, cyArrow, arrowSize, arrowSize, true, fb);
+  }
+  // Right half (next)
+  {
+    int hx = nx + nw / 2;
+    int cxArrow = hx + nw / 4;
+    int cyArrow = arrowRowY + (DAILY_NAV_ARROW_H - arrowSize) / 2;
+    drawArrowButton(cxArrow - arrowSize / 2, cyArrow, arrowSize, arrowSize, false, fb);
+  }
 }
 
 static void renderDailyView() {
@@ -1907,22 +1704,13 @@ static void renderDailyView() {
 
   int contentTop = statusY + DAILY_STATUS_H + 8;
 
-  // -- Left column: calendar + back button --------------------------
+  // -- Left column: calendar + nav container ----------------------
   int pageX = cx + DAILY_PAGE_MARGIN;
   int pageY = contentTop;
   drawTearOffCalendar(pageX, pageY, DAILY_PAGE_SIZE, day, fb);
 
-  int backX = pageX;
-  int backY = pageY + DAILY_PAGE_SIZE + DAILY_BACK_GAP;
-  epd_fill_rect(backX, backY, DAILY_BACK_W, DAILY_BACK_H, EPD_WHITE, fb);
-  epd_draw_rect(backX, backY, DAILY_BACK_W, DAILY_BACK_H, EPD_BLACK, fb);
-  {
-    const char* backStr = "< Back to Week";
-    int32_t tw = measureTextWidth((GFXfont*)&MeltSwashes18, backStr);
-    int32_t btx = backX + (DAILY_BACK_W - tw) / 2;
-    int32_t bty = backY + 28;
-    writeln((GFXfont*)&MeltSwashes18, backStr, &btx, &bty, fb);
-  }
+  // Nav container (Back to Week + prev/next day) below the calendar.
+  drawDailyNav(fb);
 
   // -- Right column: event list or event detail --------------------
   int listX, listY, listW, listH;
@@ -2048,16 +1836,13 @@ static void renderDailyView() {
       displayed++;
     }
   }
-
-  drawLeftFooter(fb);
-  drawRightFooter(fb);
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 void render() {
-  if (s_events == nullptr || s_eventCount == 0) {
+  if (s_screen != SCREEN_SETTINGS && (s_events == nullptr || s_eventCount == 0)) {
     uint8_t* fb = display_mgr::framebuffer();
     memset(fb, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
     const char* msg = "Waiting for data...";
@@ -2071,9 +1856,10 @@ void render() {
   }
 
   switch (s_screen) {
-    case SCREEN_WEEKLY: renderWeeklyView(); break;
-    case SCREEN_DAILY:  renderDailyView();  break;
-    default:          renderWeeklyView(); break;
+    case SCREEN_WEEKLY:   renderWeeklyView();   break;
+    case SCREEN_DAILY:    renderDailyView();    break;
+    case SCREEN_SETTINGS: ui_settings::render(); break;
+    default:              renderWeeklyView();   break;
   }
 }
 
@@ -2083,8 +1869,37 @@ void setEvents(const CalendarEvent* events, int count) {
   s_pendingRender = true;
 }
 
-void next() {
-  s_screen = (s_screen == SCREEN_WEEKLY) ? SCREEN_DAILY : SCREEN_WEEKLY;
+void toggleSettings() {
+  // The button is independent of touch; reset the gesture machine so a finger
+  // that was down when the button was pressed doesn't register as a spurious
+  // tap when the modal later closes.
+  s_phase = TOUCH_IDLE;
+  s_awaitingRelease = false;
+  s_startX = s_lastX = 0;
+  s_startY = s_lastY = 0;
+
+  if (s_screen == SCREEN_SETTINGS) {
+    // Close — restore the previous view with a full refresh.
+    s_screen = s_prevScreen;
+    s_pendingRender = true;
+    s_refreshMode = REFRESH_FULL;
+  } else {
+    // Open — modal over the current view, partial refresh of the modal rect.
+    s_prevScreen = s_screen;
+    s_screen = SCREEN_SETTINGS;
+    ui_settings::markFullRedraw();
+    s_pendingRender = true;
+    s_refreshMode = REFRESH_PARTIAL_SETTINGS;
+  }
+  s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
+}
+
+void resetToDefaultView() {
+  s_screen = SCREEN_WEEKLY;
+  s_baseDayOffset = 0;
+  s_selectedEventIdx = -1;
+  s_pendingRender = true;
+  s_refreshMode = REFRESH_FULL;
 }
 
 } // namespace ui
