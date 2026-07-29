@@ -72,19 +72,34 @@ static void doRender() {
   // Check if ui has pending changes
   if (!needsFullRender && !ui::needsRender()) return;
 
-  display_mgr::powerOn();
-
-  // Always clear the panel — e-paper retains the previous image, so
-  // skipping this causes new content to layer on top of the old.
-  epd_clear();
-
-  ui::render();
-
-  display_mgr::fullRefresh();
-  display_mgr::powerOff();
+  if (needsFullRender) {
+    // Full refresh — screen change, wake, or new data
+    display_mgr::powerOn();
+    epd_clear();
+    ui::render();
+    display_mgr::fullRefresh();
+    display_mgr::powerOff();
+    Serial.println("[render] Full refresh");
+  } else {
+    // Check for partial refresh mode
+    int mode = ui::refreshMode();
+    if (mode == 2) {  // REFRESH_PARTIAL_DAILY
+      ui::render();
+      int dx, dy, dw, dh;
+      ui::getDailyDirtyRect(dx, dy, dw, dh);
+      display_mgr::partialRefresh(dx, dy, dw, dh);
+      Serial.println("[render] Partial refresh (daily)");
+    } else {
+      display_mgr::powerOn();
+      epd_clear();
+      ui::render();
+      display_mgr::fullRefresh();
+      display_mgr::powerOff();
+      Serial.println("[render] Full refresh");
+    }
+  }
 
   needsFullRender = false;
-  Serial.println("[render] Screen updated");
 }
 
 static void handleTouch() {

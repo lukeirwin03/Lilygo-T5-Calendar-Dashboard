@@ -31,4 +31,7 @@ int refreshMode();
 // Populates the dirty rectangle for a partial settings refresh.
 void getSettingsDirtyRect(int& x, int& y, int& w, int& h);
 
+// Populates the dirty rectangle for a partial daily view refresh.
+void getDailyDirtyRect(int& x, int& y, int& w, int& h);
+
 } // namespace ui

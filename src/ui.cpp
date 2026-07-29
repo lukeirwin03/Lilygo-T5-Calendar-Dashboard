@@ -57,17 +57,17 @@ static constexpr int MIN_BLOCK_HEIGHT = 76;  // px; tuned for MeltSwashes18 time
 static constexpr int SHORT_EVENT_THRESHOLD = 60;   // min; events <= this use 1-line format
 static constexpr int SHORT_EVENT_MIN_H     = 28;   // px; 1-line block min height
 static constexpr int SHORT_EVENT_MAX_H     = 50;   // px; 1-line block max height (at 60 min)
-static constexpr int LONG_EVENT_CAP_MIN    = 180;  // min; events this long or longer cap here
+static constexpr int LONG_EVENT_CAP_MIN    = 480;  // min; events longer than this (8hr) plateau — likely all-day anyway
 
 // Daily view layout — shared between renderDailyView() and hitBackButton()
 // to prevent coordinate mismatches.
-static constexpr int DAILY_PAGE_SIZE    = 280;  // tear-off calendar square
+static constexpr int DAILY_PAGE_SIZE    = 220;  // tear-off calendar square (was 280)
 static constexpr int DAILY_PAGE_MARGIN  = 16;   // offset from content rect
-static constexpr int DAILY_BACK_W       = 280;  // back button width (matches DAILY_PAGE_SIZE)
-static constexpr int DAILY_BACK_H       = 48;   // back button height
+static constexpr int DAILY_BACK_W       = 220;  // back button width (was 280, matches page)
+static constexpr int DAILY_BACK_H       = 40;   // back button height (was 48)
 static constexpr int DAILY_BACK_GAP     = 12;   // gap between calendar and back button
 static constexpr int DAILY_LIST_GAP     = 24;   // gap between calendar column and list
-static constexpr int DAILY_ROW_H        = 100;  // event list row height (per ui.txt)
+static constexpr int DAILY_ROW_H        = 60;   // compact 2-line row (was 100)
 static constexpr int DAILY_STATUS_H     = 32;   // status strip height
 
 // ---------------------------------------------------------------------------
@@ -83,10 +83,18 @@ static Screen s_screen = SCREEN_WEEKLY;
 static Screen s_prevScreen = SCREEN_WEEKLY;  // restored on settings close
 static int        s_baseDayOffset = 0;
 
+// Daily view: selected event for detail display. -1 = list mode, >= 0 = detail mode
+// storing the global event index into s_events[].
+static int s_selectedEventIdx = -1;
+
+// Cached sorted event indices for the current daily view, used by touch hit-testing.
+static int s_dailyIndices[32];
+static int s_dailyCount = 0;
+
 static bool       s_pendingRender = false;
 
-// Refresh mode: full or partial (settings row update).
-enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS };
+// Refresh mode: full or partial (settings/daily row update).
+enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS, REFRESH_PARTIAL_DAILY };
 static RefreshMode s_refreshMode = REFRESH_FULL;
 
 // Last action description for diagnostics.
@@ -105,6 +113,12 @@ static int16_t    s_lastX  = 0;
 static int16_t    s_lastY  = 0;
 static unsigned long s_startMs = 0;
 static unsigned long s_cooldownUntilMs = 0;
+
+// Release gate: after a gesture is processed, require at least one !isTouched
+// poll before accepting new touches. Prevents stale touch data buffered during
+// the multi-second e-paper render from being misinterpreted as a second tap.
+static bool          s_awaitingRelease = false;
+static unsigned long s_awaitingReleaseMs = 0;
 
 // Debug mode unlocks the Settings screen. Persisted across deep sleep so the
 // user only has to enable it once. Toggled by long-pressing the battery icon.
@@ -219,6 +233,7 @@ static bool hasAllDayEventOnDate(const char* dateStr, const char* title) {
 }
 
 static void formatTime(int hour, int min, char* buf, size_t len) {
+  hour = hour % 24;
   int h = hour % 12;
   if (h == 0) h = 12;
   const char* ampm = (hour < 12) ? "AM" : "PM";
@@ -228,10 +243,47 @@ static void formatTime(int hour, int min, char* buf, size_t len) {
 // Compact time format: "3:30PM" (no space before AM/PM). Used in the
 // 1-line short-event format where horizontal space is at a premium.
 static void formatTimeCompact(int hour, int min, char* buf, size_t len) {
+  hour = hour % 24;
   int h = hour % 12;
   if (h == 0) h = 12;
   const char* ampm = (hour < 12) ? "AM" : "PM";
   snprintf(buf, len, "%d:%02d%s", h, min, ampm);
+}
+
+// Compact 24-hour time range: "0900-1000". Saves horizontal space by
+// dropping the colon and AM/PM. Handles midnight wrap via modulo 24.
+static void formatTimeRange24(int startHour, int startMin, int durationMin,
+                               char* buf, size_t len) {
+  int endTotal = startHour * 60 + startMin + durationMin;
+  int eh = (endTotal / 60) % 24;
+  int em = endTotal % 60;
+  snprintf(buf, len, "%02d%02d-%02d%02d", startHour, startMin, eh, em);
+}
+
+// Ultra-compact 12-hour range. Same half: "9:00-10:00AM".
+// Different halves: "11:30A-1:00P". For narrow context columns.
+static void formatTimeRangeUltraCompact(int startHour, int startMin, int durationMin,
+                                         char* buf, size_t len) {
+  int endTotal = startHour * 60 + startMin + durationMin;
+  int eh = (endTotal / 60) % 24;
+  int em = endTotal % 60;
+  int sh12 = startHour % 12;  if (sh12 == 0) sh12 = 12;
+  int eh12 = eh % 12;          if (eh12 == 0) eh12 = 12;
+  const char* sap = (startHour < 12) ? "AM" : "PM";
+  const char* eap = (eh < 12) ? "AM" : "PM";
+
+  if (sap == eap) {
+    // Same half — show AM/PM once at the end: "9:00-10:00AM"
+    snprintf(buf, len, "%d:%02d-%d:%02d%s", sh12, startMin, eh12, em, eap);
+  } else {
+    // Different halves — abbreviate each: "11:30A-1:00P"
+    snprintf(buf, len, "%d:%02d%c-%d:%02d%c", sh12, startMin, sap[0], eh12, em, eap[0]);
+  }
+}
+
+// 24-hour time with colon: "09:00", "14:30". Used in the focus column.
+static void formatTime24Colon(int hour, int min, char* buf, size_t len) {
+  snprintf(buf, len, "%02d:%02d", hour, min);
 }
 
 // Format a time range like "3:30 - 4:00 PM" (compact, same AM/PM) or
@@ -264,9 +316,9 @@ static void formatTimeRange(int startHour, int startMin, int durationMin,
 // - Short events (<= SHORT_EVENT_THRESHOLD): 1-line format, proportional
 //   in the SHORT_EVENT_MIN_H..SHORT_EVENT_MAX_H range (clamped to 30 min floor).
 // - Longer events: 2-line format, larger of MIN_BLOCK_HEIGHT and proportional, with
-//   the proportional value capped at LONG_EVENT_CAP_MIN so events longer than
-//   3 hr render at the same height (the user's "consistent size above 3 hr" rule).
-static int computeBlockHeight(int durationMin, int timelineH, int dayMinutes) {
+//   the proportional value capped at LONG_EVENT_CAP_MIN (8 hr) so very long events
+//   plateau rather than dominating the column.
+static int computeBlockHeight(int durationMin, int timelineH, int dayMinutes, int minH) {
   if (durationMin <= SHORT_EVENT_THRESHOLD) {
     int clamped = max(30, durationMin);
     return SHORT_EVENT_MIN_H
@@ -274,7 +326,7 @@ static int computeBlockHeight(int durationMin, int timelineH, int dayMinutes) {
   }
   int cappedDur = min(durationMin, LONG_EVENT_CAP_MIN);
   int proportional = (cappedDur * timelineH) / dayMinutes;
-  return max(MIN_BLOCK_HEIGHT, proportional);
+  return max(minH, proportional);
 }
 
 // Collect event indices for a date, logging when the per-day cap is hit.
@@ -551,6 +603,158 @@ static void drawGapIndicator(int x, int y, int w, uint8_t dotColor, uint8_t* fb)
   }
 }
 
+// Draw the all-day event banner as a black rectangle at the top of the timeline.
+// `allDayTitles` is an array of title strings, `allDayTitleCount` is its length.
+// `day` is the current day struct (for computing prev/next-day multi-day arrows).
+// Does nothing if allDayTitleCount == 0.
+static void drawAllDayBanner(const char** allDayTitles, int allDayTitleCount,
+                             const struct tm& day,
+                             int x, int colW, int timelineTop,
+                             uint8_t* fb) {
+  if (allDayTitleCount == 0) return;
+
+  // Compute prev-day and next-day date strings for multi-day arrow detection.
+  struct tm prevDay = day;
+  prevDay.tm_mday -= 1;
+  mktime(&prevDay);
+  char prevDateStr[12];
+  dateToString(prevDay, prevDateStr, sizeof(prevDateStr));
+
+  struct tm nextDay = day;
+  nextDay.tm_mday += 1;
+  mktime(&nextDay);
+  char nextDateStr[12];
+  dateToString(nextDay, nextDateStr, sizeof(nextDateStr));
+
+  char bannerText[96] = "";
+  for (int t = 0; t < allDayTitleCount; t++) {
+    const char* title = allDayTitles[t];
+    bool continuedFromPrev = hasAllDayEventOnDate(prevDateStr, title);
+    bool continuesToNext   = hasAllDayEventOnDate(nextDateStr, title);
+
+    char entry[80];
+    snprintf(entry, sizeof(entry), "%s%s%s",
+             continuedFromPrev ? "← " : "",
+             title,
+             continuesToNext ? " →" : "");
+
+    if (t > 0) strlcat(bannerText, ", ", sizeof(bannerText));
+    strlcat(bannerText, entry, sizeof(bannerText));
+  }
+
+  int bannerRectH = 36;
+  int bannerX = x + 4;
+  int bannerY = timelineTop;
+  int bannerW = colW - 8;
+
+  epd_fill_rect(bannerX, bannerY, bannerW, bannerRectH, EPD_BLACK, fb);
+
+  char fitText[96];
+  truncateToFitWidth((GFXfont*)&MeltSwashes18, bannerText, bannerW - 16,
+                     fitText, sizeof(fitText));
+  drawCenteredTextColored(fitText, x + colW / 2, bannerY + bannerRectH / 2 + 6,
+                          (GFXfont*)&MeltSwashes18, fb, C_WHITE, C_BLACK);
+}
+
+// Render a chronological text list of timed events for a context column.
+// Each event occupies 2 lines: ultra-compact time range (MeltSwashes14, DKGRAY)
+// on the first line, truncated title (MeltSwashes14, BLACK) on the second.
+// All-day events are skipped (they render in the banner). Events are listed
+// top-to-bottom in the order they appear in colIndices (sorted by start time).
+// Shows "+N more..." at the bottom if not all events fit.
+static void drawContextList(const int* colIndices, int count,
+                            int x, int colW,
+                            int listStartY, int listEndY,
+                            uint8_t* fb) {
+  const int TIME_BASELINE = 22;    // baseline of time text (MeltSwashes14 ascender is ~22)
+  const int TITLE_BASELINE = 48;   // baseline of title text (26px below time, clears descender)
+  const int ENTRY_HEIGHT = 60;     // total height per entry
+
+  const int PADDING = 8;
+  int textW = colW - PADDING * 2;
+
+  int entryTop = listStartY;
+  int displayed = 0;
+
+  for (int e = 0; e < count; e++) {
+    const CalendarEvent& ev = s_events[colIndices[e]];
+    if (ev.allDay) continue;
+
+    // Need room for both the time line and the title line.
+    if (entryTop + TITLE_BASELINE > listEndY) {
+      // Show "+N more..." for remaining timed events.
+      // Use the row background that would alternate next.
+      int remaining = 0;
+      for (int e2 = e; e2 < count; e2++) {
+        if (!s_events[colIndices[e2]].allDay) remaining++;
+      }
+      if (remaining > 0) {
+        uint8_t rowBg = (displayed % 2 == 1) ? C_LTGRAY : C_WHITE;
+        if (rowBg == C_LTGRAY) {
+          epd_fill_rect(x + 1, entryTop, colW - 2, ENTRY_HEIGHT, EPD_LTGRAY, fb);
+        }
+        char moreStr[24];
+        snprintf(moreStr, sizeof(moreStr), "+%d more...", remaining);
+        drawTextColored((GFXfont*)&MeltSwashes14, moreStr,
+                        x + PADDING, entryTop + TIME_BASELINE, fb,
+                        C_DKGRAY, rowBg);
+      }
+      break;
+    }
+
+    // Alternating row background for odd entries (zebra stripes).
+    uint8_t rowBg = (displayed % 2 == 1) ? C_LTGRAY : C_WHITE;
+    if (rowBg == C_LTGRAY) {
+      epd_fill_rect(x + 1, entryTop, colW - 2, ENTRY_HEIGHT, EPD_LTGRAY, fb);
+    }
+
+    // Line 1: ultra-compact time range (e.g., "9:00A-10:00A")
+    char timeBuf[20];
+    formatTimeRangeUltraCompact(ev.startHour, ev.startMin, ev.durationMin,
+                                timeBuf, sizeof(timeBuf));
+    char timeFit[20];
+    truncateToFitWidth((GFXfont*)&MeltSwashes14, timeBuf, textW,
+                       timeFit, sizeof(timeFit));
+    drawTextColored((GFXfont*)&MeltSwashes14, timeFit,
+                    x + PADDING, entryTop + TIME_BASELINE, fb,
+                    C_DKGRAY, rowBg);
+
+    // Line 2: title (truncated to fit column width)
+    char titleBuf[64];
+    truncateToFitWidth((GFXfont*)&MeltSwashes14, ev.title, textW,
+                       titleBuf, sizeof(titleBuf));
+    drawTextColored((GFXfont*)&MeltSwashes14, titleBuf,
+                    x + PADDING, entryTop + TITLE_BASELINE, fb,
+                    C_BLACK, rowBg);
+
+    entryTop += ENTRY_HEIGHT;
+    displayed++;
+  }
+}
+
+// Draw a right-pointing triangle as a "now" time indicator inside the focus
+// column. Positioned at the left edge at the Y coordinate matching `nowMin`.
+// White fill with a black outline for visibility on both light and dark blocks.
+static void drawNowMarker(int x, int nowY, uint8_t* fb) {
+  const int triW = 12;
+  const int triH = 10;
+  int halfH = triH / 2;
+  int y = nowY - halfH;
+
+  // White fill using horizontal scan lines.
+  for (int dy = 0; dy < triH; dy++) {
+    int dist = (dy < halfH) ? (halfH - dy) : (dy - halfH);
+    int rowW = triW - (triW * dist) / halfH;
+    if (rowW < 1) rowW = 1;
+    epd_draw_hline(x, y + dy, rowW, EPD_WHITE, fb);
+  }
+
+  // Black outline: top edge, bottom edge, left edge.
+  epd_draw_line(x, y, x + triW, y + halfH, EPD_BLACK, fb);
+  epd_draw_line(x, y + triH - 1, x + triW, y + halfH, EPD_BLACK, fb);
+  epd_draw_line(x, y, x, y + triH - 1, EPD_BLACK, fb);
+}
+
 // Render text with a 1 px black outline around the fg_color fill. Used for
 // white text on dark fills where bare white lacks edge definition. The
 // patched font renderer skips transparent pixels, so the 8 outline passes
@@ -621,8 +825,8 @@ static void drawArrowButton(int x, int y, int w, int h, bool left, uint8_t* fb) 
 }
 
 static void drawTearOffCalendar(int x, int y, int size, const struct tm& day, uint8_t* fb) {
-  int bindingH = 34;
-  int tearH = 14;
+  int bindingH = 28;
+  int tearH = 12;
 
   epd_fill_rect(x, y, size, size, EPD_WHITE, fb);
   epd_draw_rect(x, y, size, size, EPD_BLACK, fb);
@@ -632,29 +836,29 @@ static void drawTearOffCalendar(int x, int y, int size, const struct tm& day, ui
   epd_draw_rect(x, y, size, bindingH, EPD_BLACK, fb);
 
   // Rings
-  for (int rx = x + 22; rx < x + size; rx += 44) {
-    epd_fill_rect(rx, y + 10, 16, 16, EPD_WHITE, fb);
-    epd_draw_rect(rx, y + 10, 16, 16, EPD_BLACK, fb);
+  for (int rx = x + 16; rx < x + size; rx += 34) {
+    epd_fill_rect(rx, y + 7, 12, 12, EPD_WHITE, fb);
+    epd_draw_rect(rx, y + 7, 12, 12, EPD_BLACK, fb);
   }
 
   // Zigzag tear line just below binding
   int tearY = y + bindingH + 1;
-  int zigW = 20;
+  int zigW = 16;
   for (int zx = x; zx < x + size - 1; zx += zigW) {
     epd_draw_line(zx, tearY, zx + zigW / 2, tearY + tearH, EPD_BLACK, fb);
     epd_draw_line(zx + zigW / 2, tearY + tearH, zx + zigW, tearY, EPD_BLACK, fb);
   }
 
-  // Day name (extra top padding)
-  int nameY = y + bindingH + tearH + 44;
+  // Day name (Genty24)
+  int nameY = y + bindingH + tearH + 36;
   drawCenteredText(dayName(day.tm_wday), x + size / 2, nameY,
                    (GFXfont*)&Genty24, fb);
 
-  // Large day number (extra space below day name)
+  // Large day number (Genty32)
   char numStr[8];
   snprintf(numStr, sizeof(numStr), "%d", day.tm_mday);
-  int numberY = nameY + 118;
-  drawCenteredText(numStr, x + size / 2, numberY, (GFXfont*)&Genty48, fb);
+  int numberY = nameY + 80;
+  drawCenteredText(numStr, x + size / 2, numberY, (GFXfont*)&Genty32, fb);
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +944,9 @@ static bool isInCooldown() {
 
 static void triggerNav(int days) {
   s_baseDayOffset += days;
+  s_selectedEventIdx = -1;
   s_pendingRender = true;
+  s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
 }
 
@@ -844,6 +1050,40 @@ static bool hitBackButton(int16_t x, int16_t y) {
   return x >= bx && x <= bx + DAILY_BACK_W && y >= by && y <= by + DAILY_BACK_H;
 }
 
+// Shared geometry for the daily event list right column. Used by both
+// renderDailyView() and the touch hit-test to avoid coordinate drift.
+static void getDailyListRect(int& listX, int& listY, int& listW, int& listH) {
+  int cx, cy, cw, ch;
+  getContentRect(cx, cy, cw, ch);
+  int contentTop = cy + DAILY_STATUS_H + 8;
+  listX = cx + DAILY_PAGE_MARGIN + DAILY_PAGE_SIZE + DAILY_LIST_GAP;
+  listY = contentTop;
+  listW = cx + cw - DAILY_PAGE_MARGIN - listX;
+  listH = ch - (contentTop - cy) - 8;
+}
+
+// Hit test for event row taps in the daily list. Returns the global event
+// index (into s_events[]) of the tapped row, or -1 if the tap is outside
+// the list area or beyond the visible rows.
+static int hitDailyEventRow(int16_t x, int16_t y) {
+  if (s_screen != SCREEN_DAILY || s_selectedEventIdx >= 0) return -1;
+  int listX, listY, listW, listH;
+  getDailyListRect(listX, listY, listW, listH);
+  if (x < listX || x > listX + listW || y < listY) return -1;
+  int row = (y - listY) / DAILY_ROW_H;
+  int maxRows = listH / DAILY_ROW_H;
+  if (row < 0 || row >= s_dailyCount || row >= maxRows) return -1;
+  return s_dailyIndices[row];
+}
+
+// Hit test for the "Back to list" button in daily detail mode.
+static bool hitDailyDetailBack(int16_t x, int16_t y) {
+  if (s_screen != SCREEN_DAILY || s_selectedEventIdx < 0) return false;
+  int listX, listY, listW, listH;
+  getDailyListRect(listX, listY, listW, listH);
+  return (x >= listX && x <= listX + listW && y >= listY && y <= listY + 40);
+}
+
 // Classify a completed touch gesture and fire the appropriate action.
 static void classifyGesture() {
   unsigned long dur = millis() - s_startMs;
@@ -882,8 +1122,37 @@ static void classifyGesture() {
     return;
   }
 
+  // Daily view: event row tap or detail back button
+  if (s_screen == SCREEN_DAILY) {
+    if (s_selectedEventIdx >= 0) {
+      // Detail mode — check for "← Back to list" button
+      if (hitDailyDetailBack(s_startX, s_startY)) {
+        s_selectedEventIdx = -1;
+        s_pendingRender = true;
+        s_refreshMode = REFRESH_PARTIAL_DAILY;
+        s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
+        snprintf(s_lastAction, sizeof(s_lastAction), "daily detail -> list");
+        return;
+      }
+    } else {
+      // List mode — check for event row tap
+      int eventIdx = hitDailyEventRow(s_startX, s_startY);
+      if (eventIdx >= 0) {
+        s_selectedEventIdx = eventIdx;
+        s_pendingRender = true;
+        s_refreshMode = REFRESH_PARTIAL_DAILY;
+        s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
+        s_awaitingRelease = true;
+        s_awaitingReleaseMs = millis();
+        snprintf(s_lastAction, sizeof(s_lastAction), "daily list -> event %d", eventIdx);
+        return;
+      }
+    }
+  }
+
   // Back button on daily view
   if (s_screen == SCREEN_DAILY && hitBackButton(s_startX, s_startY)) {
+    s_selectedEventIdx = -1;
     triggerScreenChange(SCREEN_WEEKLY, s_baseDayOffset);
     return;
   }
@@ -973,6 +1242,7 @@ static void classifyGesture() {
         return;
       } else {
         // col == 1, focus column = open daily view for the focus day
+        s_selectedEventIdx = -1;
         triggerScreenChange(SCREEN_DAILY, s_baseDayOffset);
         snprintf(s_lastAction + strlen(s_lastAction), sizeof(s_lastAction) - strlen(s_lastAction),
                  " [focus -> daily]");
@@ -1009,6 +1279,18 @@ void updateTouch(bool isTouched, int16_t x, int16_t y) {
   }
 #endif
 
+  // Release gate: after a gesture, wait for the finger to be confirmed lifted
+  // before accepting new touches. This prevents stale GT911 data (buffered
+  // during the multi-second e-paper render) from triggering a duplicate action.
+  // The 5-second timeout prevents permanent lockup if INT gets stuck.
+  if (s_awaitingRelease) {
+    if (!isTouched || millis() - s_awaitingReleaseMs > 5000) {
+      s_awaitingRelease = false;
+      s_phase = TOUCH_IDLE;
+    }
+    return;
+  }
+
   if (isInCooldown()) {
     if (!isTouched) s_phase = TOUCH_IDLE;
     return;
@@ -1030,6 +1312,8 @@ void updateTouch(bool isTouched, int16_t x, int16_t y) {
         s_lastY = y;
       } else {
         classifyGesture();
+        s_awaitingRelease = true;
+        s_awaitingReleaseMs = millis();
         s_phase = TOUCH_IDLE;
       }
       break;
@@ -1045,13 +1329,26 @@ bool needsRender() {
 }
 
 int refreshMode() {
-  return (int)s_refreshMode;
+  int mode = (int)s_refreshMode;
+  s_refreshMode = REFRESH_FULL;  // reset so unrelated renders default to full
+  return mode;
 }
 
 void getSettingsDirtyRect(int& x, int& y, int& w, int& h) {
 #ifndef ENV_DEMO
   ui_settings::getDirtyRect(x, y, w, h);
 #endif
+}
+
+void getDailyDirtyRect(int& x, int& y, int& w, int& h) {
+  int listX, listY, listW, listH;
+  getDailyListRect(listX, listY, listW, listH);
+  // Pad slightly beyond the list bounds for anti-aliased text edges.
+  // 4-pixel alignment is handled by partialRefresh() itself.
+  x = listX - 4;
+  y = listY - 4;
+  w = listW + 8;    // 4px each side
+  h = listH + 4;    // 4px top only
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1584,9 @@ static void renderWeeklyView() {
 
     drawCenteredText(headerStr, x + colW / 2, cy + 42, (GFXfont*)&Genty24, fb);
 
+    // Separator between the date header and the column content.
+    epd_draw_hline(x, cy + headerH, colW, EPD_BLACK, fb);
+
     char dateStr[12];
     dateToString(day, dateStr, sizeof(dateStr));
     int colIndices[32];
@@ -1314,7 +1614,7 @@ static void renderWeeklyView() {
       continue;  // skip the rest of the loop body for this column
     }
 
-    // ----- All-day banner titles (collected here, drawn after grid lines) -----
+    // ----- All-day banner titles (collected here, drawn in both paths) -----
     const char* allDayTitles[8];
     int allDayTitleCount = 0;
     for (int e = 0; e < colCount; e++) {
@@ -1327,114 +1627,6 @@ static void renderWeeklyView() {
       if (!already && allDayTitleCount < 8) {
         allDayTitles[allDayTitleCount++] = ev.title;
       }
-    }
-
-    // Count events entirely outside the visible time range so we can hint at
-    // the top/bottom of the timeline when early-morning or late-evening events
-    // are hidden.
-    int beforeRangeCount = 0;
-    int afterRangeCount = 0;
-    for (int e = 0; e < colCount; e++) {
-      const CalendarEvent& ev = s_events[colIndices[e]];
-      if (ev.allDay) continue;
-      int startMin = ev.startHour * 60 + ev.startMin;
-      int endMin = startMin + ev.durationMin;
-      if (endMin <= dayStartHour * 60) beforeRangeCount++;
-      else if (startMin >= dayEndHour * 60) afterRangeCount++;
-    }
-
-    // 3-hour grid markers (same Y in every column).
-    for (int h = dayStartHour; h <= dayEndHour; h += 3) {
-      int minFromStart = (h - dayStartHour) * 60;
-      int yy = timelineTop + (minFromStart * timelineH) / dayMinutes;
-      epd_draw_hline(x + 8, yy, colW - 16, EPD_LTGRAY, fb);
-    }
-
-    // Subtle terminator at the bottom of the timeline area.
-    int timelineBottomY = timelineTop + timelineH;
-    epd_draw_hline(x + 4, timelineBottomY, colW - 8, EPD_LTGRAY, fb);
-
-    // Draw the all-day banner as a black rectangle overlaid at the top of
-    // the timeline area. Grid lines and any 7 AM event behind it are hidden;
-    // that is acceptable because the banner is more important.
-    if (allDayTitleCount > 0) {
-      // Compute prev-day and next-day date strings (for multi-day arrow detection).
-      struct tm prevDay = day;
-      prevDay.tm_mday -= 1;
-      mktime(&prevDay);
-      char prevDateStr[12];
-      dateToString(prevDay, prevDateStr, sizeof(prevDateStr));
-
-      struct tm nextDay = day;
-      nextDay.tm_mday += 1;
-      mktime(&nextDay);
-      char nextDateStr[12];
-      dateToString(nextDay, nextDateStr, sizeof(nextDateStr));
-
-      // Build the banner text with multi-day arrows per title.
-      char bannerText[96] = "";
-      for (int t = 0; t < allDayTitleCount; t++) {
-        const char* title = allDayTitles[t];
-        bool continuedFromPrev = hasAllDayEventOnDate(prevDateStr, title);
-        bool continuesToNext   = hasAllDayEventOnDate(nextDateStr, title);
-
-        // Build "← Title →" or subset
-        char entry[80];
-        snprintf(entry, sizeof(entry), "%s%s%s",
-                 continuedFromPrev ? "← " : "",
-                 title,
-                 continuesToNext ? " →" : "");
-
-        // Append to bannerText with ", " separator if not first
-        if (t > 0) {
-          strlcat(bannerText, ", ", sizeof(bannerText));
-        }
-        strlcat(bannerText, entry, sizeof(bannerText));
-      }
-
-      int bannerRectH = 36;
-      int bannerX = x + 4;
-      int bannerY = timelineTop;
-      int bannerW = colW - 8;
-
-      epd_fill_rect(bannerX, bannerY, bannerW, bannerRectH, EPD_BLACK, fb);
-
-      // Truncate the combined text to fit, then center it inside the banner rect.
-      char fitText[96];
-      truncateToFitWidth((GFXfont*)&MeltSwashes18, bannerText, bannerW - 16,
-                         fitText, sizeof(fitText));
-      drawCenteredTextColored(fitText, x + colW / 2, bannerY + bannerRectH / 2 + 6,
-                              (GFXfont*)&MeltSwashes18, fb, C_WHITE, C_BLACK);
-    }
-
-    // Indicator for events before the visible time range (early morning).
-    int beforeIndicatorY = timelineTop + 12;
-    if (allDayTitleCount > 0) {
-      beforeIndicatorY = timelineTop + 36 + 4;  // render below the banner
-    }
-    if (beforeRangeCount > 0) {
-      char indBuf[32];
-      snprintf(indBuf, sizeof(indBuf), "↑ %d before %dAM", beforeRangeCount, dayStartHour);
-      FontProperties props;
-      props.fg_color = C_DKGRAY;
-      props.bg_color = C_WHITE;
-      props.flags = 0;
-      props.fallback_glyph = 0;
-      int32_t ix = x + 8, iy = beforeIndicatorY;
-      write_mode((GFXfont*)&MeltSwashes14, indBuf, &ix, &iy, fb, BLACK_ON_WHITE, &props);
-    }
-
-    // Indicator for events after the visible time range (late evening).
-    if (afterRangeCount > 0) {
-      char indBuf[32];
-      snprintf(indBuf, sizeof(indBuf), "↓ %d after %dPM", afterRangeCount, dayEndHour - 12);
-      FontProperties props;
-      props.fg_color = C_DKGRAY;
-      props.bg_color = C_WHITE;
-      props.flags = 0;
-      props.fallback_glyph = 0;
-      int32_t ix = x + 8, iy = timelineTop + timelineH - 4;
-      write_mode((GFXfont*)&MeltSwashes14, indBuf, &ix, &iy, fb, BLACK_ON_WHITE, &props);
     }
 
     // Sort by start time, earliest first. All-day events sort before timed ones.
@@ -1457,21 +1649,130 @@ static void renderWeeklyView() {
       colIndices[j + 1] = idx;
     }
 
-    // Compute lane assignments for this day's events (focus column only).
-    LaneAssignment laneAssignments[32];
-    if (isFocus) {
-      computeLaneAssignments(s_events, colIndices, colCount, laneAssignments);
-    } else {
-      // Context columns: every event in 1-lane mode (full column width).
-      for (int e = 0; e < colCount; e++) {
-        laneAssignments[e].lane = 0;
-        laneAssignments[e].laneCount = 1;
-      }
+    // Context columns: simple chronological text list.
+    if (!isFocus) {
+      drawAllDayBanner(allDayTitles, allDayTitleCount, day, x, colW, timelineTop, fb);
+
+      int listStartY = timelineTop;
+      if (allDayTitleCount > 0) listStartY = timelineTop + 40;
+      int listEndY = timelineTop + timelineH - 4;
+
+      drawContextList(colIndices, colCount, x, colW, listStartY, listEndY, fb);
+      continue;
     }
 
-    // Draw gap indicators between events that have a > 60 minute gap between
-    // them. Only consider events in lane 0 (the lane that defines the timeline's
-    // visual flow). Drawn before the event blocks so events render on top.
+    // --- Focus column only below this point ---
+
+    // Compute timeline range from the focus day's timed events.
+    // Duration snaps up to a "nice" value from {3,6,9,12,18,24} hours
+    // for consistent grid line spacing and visual rhythm.
+    // Start stays fixed (earliest event - 1h), end extends to fill the nice duration.
+    int focusRangeStart = 8 * 60;   // default: 8AM (all-day-only fallback)
+    int focusRangeEnd = 20 * 60;    // default: 8PM (12h default)
+    {
+      int earliest = 24 * 60;
+      int latest = 0;
+      bool hasTimed = false;
+      for (int e = 0; e < colCount; e++) {
+        const CalendarEvent& ev = s_events[colIndices[e]];
+        if (ev.allDay) continue;
+        hasTimed = true;
+        int s = ev.startHour * 60 + ev.startMin;
+        int en = s + ev.durationMin;
+        if (s < earliest) earliest = s;
+        if (en > latest) latest = en;
+      }
+      if (hasTimed) {
+        focusRangeStart = max(4 * 60, earliest - 60);     // no earlier than 4AM
+        int paddedEnd = min(28 * 60, latest + 60);         // no later than 4AM next day
+        int duration = paddedEnd - focusRangeStart;
+
+        // Snap duration up to the next nice value
+        const int niceDurations[] = {3*60, 6*60, 9*60, 12*60, 18*60, 24*60};
+        int niceDuration = 24 * 60;
+        for (int i = 0; i < 6; i++) {
+          if (niceDurations[i] >= duration) {
+            niceDuration = niceDurations[i];
+            break;
+          }
+        }
+
+        // Extend end to fit the nice duration (start stays fixed)
+        focusRangeEnd = focusRangeStart + niceDuration;
+
+        // Clamp to 4AM-4AM ceiling
+        if (focusRangeEnd > 28 * 60) {
+          focusRangeEnd = 28 * 60;
+          focusRangeStart = focusRangeEnd - niceDuration;
+          if (focusRangeStart < 4 * 60) {
+            focusRangeStart = 4 * 60;
+            focusRangeEnd = focusRangeStart + niceDuration;
+          }
+        }
+      }
+    }
+    int focusRangeMinutes = focusRangeEnd - focusRangeStart;
+
+    // Focus column timeline geometry: extends to the bottom of the screen.
+    // When there's an all-day banner, content starts below it with a small gap.
+    // Focus column layout: [optional banner] [top label] [event area] [bottom label]
+    // Symmetric label areas at top and bottom ensure time labels are never
+    // covered by event blocks.
+    int focusContentTop = timelineTop;
+    if (allDayTitleCount > 0) focusContentTop = timelineTop + 48;  // 36px banner + 12px gap
+    else                       focusContentTop = timelineTop + 12;  // small top gap, no banner
+
+    // Timeline boundaries: minimal top padding (the start label extends upward
+    // into the banner gap), full bottom padding for the end label.
+    int focusTimelineTop  = focusContentTop + 4;
+    int focusTimelineBot  = (EPD_HEIGHT - 4) - 20;
+    int focusTimelineH    = focusTimelineBot - focusTimelineTop;
+
+    // Scale minimum block height to timeline density. In dense timelines
+    // (short range, many pixels per hour), the default MIN_BLOCK_HEIGHT
+    // causes events to overflow past their time slot, eating into gaps.
+    // Scale it down so blocks don't exceed their proportional slot.
+    int pxPerHour = focusTimelineH / max(1, focusRangeMinutes / 60);
+    int effectiveMinH = max(40, min(MIN_BLOCK_HEIGHT, pxPerHour));
+
+    // Timeline boundary lines with integrated time labels.
+    // The start and end lines pass through the label text with a gap:
+    //   ────── 8:00 AM ──────
+    {
+      int centerX = x + colW / 2;
+
+      // Start boundary (top of timeline)
+      char startLabel[16];
+      formatTime(focusRangeStart / 60, focusRangeStart % 60, startLabel, sizeof(startLabel));
+      int startTextW = measureTextWidth((GFXfont*)&MeltSwashes14, startLabel);
+      int startHalfGap = startTextW / 2 + 8;
+      epd_draw_hline(x + 8, focusTimelineTop, (centerX - startHalfGap) - (x + 8), EPD_LTGRAY, fb);
+      epd_draw_hline(centerX + startHalfGap, focusTimelineTop,
+                     (x + colW - 8) - (centerX + startHalfGap), EPD_LTGRAY, fb);
+      drawCenteredTextColored(startLabel, centerX, focusTimelineTop + 11,
+                              (GFXfont*)&MeltSwashes14, fb, C_LTGRAY, C_WHITE);
+
+      // End boundary (bottom of timeline)
+      char endLabel[16];
+      formatTime(focusRangeEnd / 60, focusRangeEnd % 60, endLabel, sizeof(endLabel));
+      int endTextW = measureTextWidth((GFXfont*)&MeltSwashes14, endLabel);
+      int endHalfGap = endTextW / 2 + 8;
+      epd_draw_hline(x + 8, focusTimelineBot, (centerX - endHalfGap) - (x + 8), EPD_LTGRAY, fb);
+      epd_draw_hline(centerX + endHalfGap, focusTimelineBot,
+                     (x + colW - 8) - (centerX + endHalfGap), EPD_LTGRAY, fb);
+      drawCenteredTextColored(endLabel, centerX, focusTimelineBot + 11,
+                              (GFXfont*)&MeltSwashes14, fb, C_LTGRAY, C_WHITE);
+    }
+
+    drawAllDayBanner(allDayTitles, allDayTitleCount, day, x, colW, timelineTop, fb);
+
+    // Compute lane assignments for this day's events (focus column only).
+    LaneAssignment laneAssignments[32];
+    computeLaneAssignments(s_events, colIndices, colCount, laneAssignments);
+
+    // Draw gap indicators between events with a >60 minute time gap.
+    // Each gap gets a faint gray fill and a centered duration label.
+    // Drawn before event blocks so events render on top.
     {
       int prevEndMin = -1;
       for (int e = 0; e < colCount; e++) {
@@ -1480,13 +1781,16 @@ static void renderWeeklyView() {
 
         int startMin = ev.startHour * 60 + ev.startMin;
         if (prevEndMin > 0 && (startMin - prevEndMin) >= 60) {
-          // Draw a gap indicator centered between prevEndY and this event's blockY
-          int prevEndY = timelineTop
-                         + ((prevEndMin - dayStartHour * 60) * timelineH) / dayMinutes;
-          int thisStartY = timelineTop
-                           + ((startMin - dayStartHour * 60) * timelineH) / dayMinutes;
-          int midY = (prevEndY + thisStartY) / 2;
-          drawGapIndicator(x + 8, midY, colW - 16, EPD_LTGRAY, fb);
+          int prevEndY = focusTimelineTop
+                         + ((prevEndMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+          int thisStartY = focusTimelineTop
+                           + ((startMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+          int gapY = prevEndY + EVENT_GAP;
+          int gapH = thisStartY - prevEndY - EVENT_GAP * 2;
+          if (gapH > 0) {
+            // Faint gray fill (shade 14, just barely darker than white)
+            epd_fill_rect(x + 6, gapY, colW - 12, gapH, 14 << 4, fb);
+          }
         }
 
         int endMin = startMin + ev.durationMin;
@@ -1494,22 +1798,52 @@ static void renderWeeklyView() {
       }
     }
 
+    // Grid lines at 1/3 and 2/3 of the timeline — drawn after gap fills
+    // so the shade-14 fill doesn't overwrite them. Events render on top.
+    {
+      int grid1Y = focusTimelineTop + focusTimelineH / 3;
+      int grid2Y = focusTimelineTop + (focusTimelineH * 2) / 3;
+      epd_draw_hline(x + 8, grid1Y, colW - 16, EPD_LTGRAY, fb);
+      epd_draw_hline(x + 8, grid2Y, colW - 16, EPD_LTGRAY, fb);
+    }
+
     for (int e = 0; e < colCount; e++) {
       const CalendarEvent& ev = s_events[colIndices[e]];
 
       if (ev.allDay) continue;  // all-day events handled in the banner above
 
-
       int startMin = ev.startHour * 60 + ev.startMin;
       int endMin   = startMin + ev.durationMin;
-      int visStart = max(startMin, dayStartHour * 60);
-      int visEnd   = min(endMin, dayEndHour * 60);
+      int visStart = max(startMin, focusRangeStart);
+      int visEnd   = min(endMin, focusRangeEnd);
       int visDur   = visEnd - visStart;
       if (visDur <= 0) continue;
 
-      int blockY = timelineTop + ((visStart - dayStartHour * 60) * timelineH) / dayMinutes;
-      int blockH = computeBlockHeight(visDur, timelineH, dayMinutes);
-      int timelineBottom = timelineTop + timelineH;
+      int blockY = focusTimelineTop + ((visStart - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+      int blockH = computeBlockHeight(visDur, focusTimelineH, focusRangeMinutes, effectiveMinH);
+
+      // Enforce minimum visual gap between non-overlapping events.
+      // If the next event starts after this one ends (time gap exists),
+      // clamp the block height so at least MIN_GAP_PX of white space
+      // remains between them.
+      {
+        const int MIN_GAP_PX = 16;
+        for (int e2 = e + 1; e2 < colCount; e2++) {
+          const CalendarEvent& nextEv = s_events[colIndices[e2]];
+          if (nextEv.allDay) continue;
+          int nextStartMin = nextEv.startHour * 60 + nextEv.startMin;
+          // Only enforce gap if there's actually a time gap (not overlapping)
+          if (nextStartMin > endMin) {
+            int nextVisStart = max(nextStartMin, focusRangeStart);
+            int nextY = focusTimelineTop + ((nextVisStart - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+            int maxH = nextY - blockY - MIN_GAP_PX;
+            if (blockH > maxH) blockH = maxH;
+          }
+          break;  // only check the immediately next event
+        }
+      }
+
+      int timelineBottom = focusTimelineBot;
       if (blockY + blockH > timelineBottom - 4) blockH = timelineBottom - 4 - blockY;
 
       // Render slightly shorter than the computed height to create a visual gap
@@ -1523,8 +1857,8 @@ static void renderWeeklyView() {
       int laneW = colW - 12;
       int laneX = x + 6;
 
-      // For the focus column, narrow the block to its lane width if multiple lanes.
-      if (isFocus) {
+      // Narrow the block to its lane width if multiple lanes (lane splitting).
+      {
         const LaneAssignment& la = laneAssignments[e];
         if (la.laneCount > 1) {
           int totalGap = (la.laneCount - 1) * 4;  // 4 px gap between lanes
@@ -1577,8 +1911,9 @@ static void renderWeeklyView() {
       }
 
       // ----- existing 2-line rendering for events > 60 min -----
-      char timeStr[16];
-      formatTime(ev.startHour, ev.startMin, timeStr, sizeof(timeStr));
+      char timeStr[24];
+      formatTimeRange(ev.startHour, ev.startMin, ev.durationMin,
+                      timeStr, sizeof(timeStr));
 
       // Time
       if (props.fg_color == C_WHITE) {
@@ -1638,42 +1973,8 @@ static void renderWeeklyView() {
                         props.fg_color, props.bg_color);
       }
 
-      // End time at the bottom of the block — only if there's room and no
-      // overlapping event would visually collide with it.
-      const int END_TIME_MIN_BLOCK_H = 100;   // need this much height for title + end time
-      const int END_TIME_BOTTOM_PADDING = 12;  // baseline is this far from block bottom
-
-      // In the focus column, lane splitting places overlapping events
-      // side-by-side, so a follower in another lane doesn't cover this block's
-      // end-time area. Suppress only when an overlapping event would paint on
-      // top (context columns or single-lane focus).
-      bool suppressEndTime = hasOverlappingFollower(ev);
-      if (isFocus && laneAssignments[e].laneCount > 1) {
-        suppressEndTime = false;
-      }
-
-      if (ev.durationMin > SHORT_EVENT_THRESHOLD
-          && blockH >= END_TIME_MIN_BLOCK_H
-          && !suppressEndTime) {
-        // Compute end time
-        int endTotal = ev.startHour * 60 + ev.startMin + ev.durationMin;
-        int eh = (endTotal / 60) % 24;
-        int emin = endTotal % 60;
-        char endStr[16];
-        formatTime(eh, emin, endStr, sizeof(endStr));
-
-        int endY = blockY + renderH - END_TIME_BOTTOM_PADDING;
-        if (props.fg_color == C_WHITE) {
-          drawTextWithOutline((GFXfont*)&MeltSwashes18, endStr,
-                              blockX + 8, endY, fb,
-                              C_WHITE, props.bg_color);
-        } else {
-          int32_t ex = blockX + 8, ey = endY;
-          write_mode((GFXfont*)&MeltSwashes18, endStr, &ex, &ey, fb,
-                     BLACK_ON_WHITE, &props);
-        }
-      }
     }
+
   }
 
   drawLeftFooter(fb);
@@ -1692,9 +1993,6 @@ static void renderDailyView() {
   uint8_t* fb = display_mgr::framebuffer();
   memset(fb, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 
-  int winX, winY, winW, winH;
-  getWindowRect(winX, winY, winW, winH);
-
   int cx, cy, cw, ch;
   getContentRect(cx, cy, cw, ch);
 
@@ -1708,11 +2006,8 @@ static void renderDailyView() {
   dateToString(day, dateStr, sizeof(dateStr));
   int indices[32];
   int count = eventsForDateLogged(dateStr, indices, 32);
-  int timedCount = 0, allDayCount = 0;
-  for (int e = 0; e < count; e++) {
-    if (s_events[indices[e]].allDay) allDayCount++;
-    else timedCount++;
-  }
+
+  // Sort by start time (all-day first)
   for (int i = 0; i < count - 1; i++) {
     for (int j = 0; j < count - 1 - i; j++) {
       if (eventSortKey(s_events[indices[j]]) > eventSortKey(s_events[indices[j+1]])) {
@@ -1723,123 +2018,171 @@ static void renderDailyView() {
     }
   }
 
-  // -- Status strip: "Events: N | All-day: N" -----------------------
+  // Cache for touch hit-testing
+  s_dailyCount = count;
+  for (int i = 0; i < count; i++) s_dailyIndices[i] = indices[i];
+
+  int timedCount = 0, allDayCount = 0;
+  for (int e = 0; e < count; e++) {
+    if (s_events[indices[e]].allDay) allDayCount++;
+    else timedCount++;
+  }
+
+  // -- Status strip -------------------------------------------------
   int statusY = cy;
   epd_fill_rect(cx, statusY, cw, DAILY_STATUS_H, EPD_LTGRAY, fb);
   epd_draw_rect(cx, statusY, cw, DAILY_STATUS_H, EPD_BLACK, fb);
   char statusBuf[48];
-  snprintf(statusBuf, sizeof(statusBuf), "Events: %d | All-day: %d",
-           timedCount, allDayCount);
+  snprintf(statusBuf, sizeof(statusBuf), "Events: %d | All-day: %d", timedCount, allDayCount);
   {
     FontProperties sp;
-    sp.fg_color = C_BLACK;
-    sp.bg_color = C_LTGRAY;
-    sp.flags = 0;
-    sp.fallback_glyph = 0;
+    sp.fg_color = C_BLACK; sp.bg_color = C_LTGRAY; sp.flags = 0; sp.fallback_glyph = 0;
     int32_t sx = cx + 12, sy = statusY + 22;
     write_mode((GFXfont*)&MeltSwashes18, statusBuf, &sx, &sy, fb, BLACK_ON_WHITE, &sp);
   }
 
-  // -- Content area starts below the status strip -------------------
   int contentTop = statusY + DAILY_STATUS_H + 8;
 
-  // -- Tear-off calendar page (left column) -------------------------
+  // -- Left column: calendar + back button --------------------------
   int pageX = cx + DAILY_PAGE_MARGIN;
   int pageY = contentTop;
   drawTearOffCalendar(pageX, pageY, DAILY_PAGE_SIZE, day, fb);
 
-  // -- Back button below the calendar -------------------------------
   int backX = pageX;
   int backY = pageY + DAILY_PAGE_SIZE + DAILY_BACK_GAP;
   epd_fill_rect(backX, backY, DAILY_BACK_W, DAILY_BACK_H, EPD_WHITE, fb);
   epd_draw_rect(backX, backY, DAILY_BACK_W, DAILY_BACK_H, EPD_BLACK, fb);
   {
-    // Center "< Back to Week" horizontally within the wider button.
     const char* backStr = "< Back to Week";
     int32_t tw = measureTextWidth((GFXfont*)&MeltSwashes18, backStr);
     int32_t btx = backX + (DAILY_BACK_W - tw) / 2;
-    int32_t bty = backY + 34;  // baseline bumped 2px for visual centering
+    int32_t bty = backY + 28;
     writeln((GFXfont*)&MeltSwashes18, backStr, &btx, &bty, fb);
   }
 
-  // -- Event list (right column) ------------------------------------
-  int listX = pageX + DAILY_PAGE_SIZE + DAILY_LIST_GAP;
-  int listY = contentTop;
-  int listW = cx + cw - DAILY_PAGE_MARGIN - listX;
-  int listH = ch - (contentTop - cy) - 8;
-  int lineH = DAILY_ROW_H;
+  // -- Right column: event list or event detail --------------------
+  int listX, listY, listW, listH;
+  getDailyListRect(listX, listY, listW, listH);
 
-  int displayed = 0;
-  int maxRows = listH / lineH;
+  if (s_selectedEventIdx >= 0 && s_selectedEventIdx < s_eventCount) {
+    // ===== Detail mode =====
+    const CalendarEvent& ev = s_events[s_selectedEventIdx];
 
-  for (int i = 0; i < count; i++) {
-    if (displayed >= maxRows) {
-      int remaining = count - displayed;
-      char moreBuf[32];
-      snprintf(moreBuf, sizeof(moreBuf), "+%d more...", remaining);
-      int32_t mx = listX + 10, my = listY + 20;
-      writeln((GFXfont*)&MeltSwashes18, moreBuf, &mx, &my, fb);
-      break;
+    // "← Back to list" button
+    epd_fill_rect(listX, listY, listW, 40, EPD_DKGRAY, fb);
+    epd_draw_rect(listX, listY, listW, 40, EPD_BLACK, fb);
+    {
+      const char* backStr = "← Back to list";
+      FontProperties bp;
+      bp.fg_color = C_WHITE; bp.bg_color = C_DKGRAY; bp.flags = 0; bp.fallback_glyph = 0;
+      int32_t bx = listX + 16, by = listY + 28;
+      write_mode((GFXfont*)&MeltSwashes18, backStr, &bx, &by, fb, BLACK_ON_WHITE, &bp);
     }
 
-    const CalendarEvent& ev = s_events[indices[i]];
-    uint8_t rowBg = (displayed % 2 == 0) ? C_LTGRAY : C_WHITE;
+    // Event details below the back button
+    int detailY = listY + 60;
 
-    if (displayed % 2 == 0) {
-      epd_fill_rect(listX, listY, listW, lineH, EPD_LTGRAY, fb);
+    // Title (Genty24)
+    char titleFit[64];
+    truncateToFitWidth((GFXfont*)&Genty24, ev.title, listW - 32, titleFit, sizeof(titleFit));
+    {
+      int32_t tx = listX + 16, ty = detailY + 34;
+      writeln((GFXfont*)&Genty24, titleFit, &tx, &ty, fb);
     }
-    epd_draw_rect(listX, listY, listW, lineH, EPD_BLACK, fb);
 
-    FontProperties rowProps;
-    rowProps.fg_color = C_BLACK;
-    rowProps.bg_color = rowBg;
-    rowProps.flags = 0;
-    rowProps.fallback_glyph = 0;
-
+    // Time range or "All day" (MeltSwashes18)
+    detailY += 60;
     if (ev.allDay) {
-      // All-day: "All day" label on top, title below in Genty24
       drawTextColored((GFXfont*)&MeltSwashes18, "All day",
-                      listX + 12, listY + 28, fb, C_BLACK, rowBg);
-
-      char lineBuf[80];
-      snprintf(lineBuf, sizeof(lineBuf), "%s | %s", ev.title, ev.location);
-      char outBuf[64];
-      truncateToFitWidth((GFXfont*)&Genty24, lineBuf, listW - 24,
-                         outBuf, sizeof(outBuf));
-      int32_t titleX = listX + 12, titleY = listY + 60;
-      write_mode((GFXfont*)&Genty24, outBuf, &titleX, &titleY, fb, BLACK_ON_WHITE, &rowProps);
-
-      char descBuf[64];
-      truncateToFitWidth((GFXfont*)&MeltSwashes18, ev.description, listW - 24,
-                         descBuf, sizeof(descBuf));
-      drawTextColored((GFXfont*)&MeltSwashes18, descBuf,
-                      listX + 12, listY + 88, fb, C_BLACK, rowBg);
+                      listX + 16, detailY, fb, C_DKGRAY, C_WHITE);
     } else {
-      // Timed: time range on top in MeltSwashes20, title below in Genty24
-      // NOTE: weekly view reverted to start-only; daily view kept as range for now.
-      char timeStr[24];
+      char timeStr[32];
       formatTimeRange(ev.startHour, ev.startMin, ev.durationMin, timeStr, sizeof(timeStr));
-
-      drawTextColored((GFXfont*)&MeltSwashes20, timeStr,
-                      listX + 12, listY + 30, fb, C_BLACK, rowBg);
-
-      char lineBuf[80];
-      snprintf(lineBuf, sizeof(lineBuf), "%s | %s", ev.title, ev.location);
-      char outBuf[64];
-      truncateToFitWidth((GFXfont*)&Genty24, lineBuf, listW - 24,
-                         outBuf, sizeof(outBuf));
-      int32_t titleX = listX + 12, titleY = listY + 62;
-      write_mode((GFXfont*)&Genty24, outBuf, &titleX, &titleY, fb, BLACK_ON_WHITE, &rowProps);
-
-      char descBuf[64];
-      truncateToFitWidth((GFXfont*)&MeltSwashes18, ev.description, listW - 24,
-                         descBuf, sizeof(descBuf));
-      drawTextColored((GFXfont*)&MeltSwashes18, descBuf,
-                      listX + 12, listY + 90, fb, C_BLACK, rowBg);
+      drawTextColored((GFXfont*)&MeltSwashes18, timeStr,
+                      listX + 16, detailY, fb, C_DKGRAY, C_WHITE);
     }
 
-    listY += lineH;
-    displayed++;
+    // Location (MeltSwashes16)
+    detailY += 32;
+    if (ev.location && ev.location[0]) {
+      char locBuf[80];
+      snprintf(locBuf, sizeof(locBuf), "Location: %s", ev.location);
+      char locFit[80];
+      truncateToFitWidth((GFXfont*)&MeltSwashes16, locBuf, listW - 32, locFit, sizeof(locFit));
+      drawTextColored((GFXfont*)&MeltSwashes16, locFit,
+                      listX + 16, detailY, fb, C_BLACK, C_WHITE);
+    }
+
+    // Description (MeltSwashes16, word-wrapped, if present)
+    detailY += 28;
+    if (ev.description && ev.description[0]) {
+      drawTextColored((GFXfont*)&MeltSwashes16, "Details:",
+                      listX + 16, detailY, fb, C_DKGRAY, C_WHITE);
+      detailY += 24;
+      WrappedText wrapped = wrapText((GFXfont*)&MeltSwashes16, ev.description,
+                                      listW - 32, 6);
+      for (int li = 0; li < wrapped.count; li++) {
+        drawTextColored((GFXfont*)&MeltSwashes16, wrapped.lines[li],
+                        listX + 16, detailY, fb, C_BLACK, C_WHITE);
+        detailY += 22;
+      }
+    }
+
+    // Calendar source (MeltSwashes14)
+    detailY += 24;
+    if (ev.calendar && ev.calendar[0]) {
+      char calBuf[48];
+      snprintf(calBuf, sizeof(calBuf), "Calendar: %s", ev.calendar);
+      drawTextColored((GFXfont*)&MeltSwashes14, calBuf,
+                      listX + 16, detailY, fb, C_LTGRAY, C_WHITE);
+    }
+
+  } else {
+    // ===== List mode: compact 2-line rows =====
+    int rowY = listY;
+    int displayed = 0;
+    int maxRows = listH / DAILY_ROW_H;
+
+    for (int i = 0; i < count; i++) {
+      if (displayed >= maxRows) {
+        int remaining = count - displayed;
+        char moreBuf[32];
+        snprintf(moreBuf, sizeof(moreBuf), "+%d more...", remaining);
+        int32_t mx = listX + 12, my = rowY + 20;
+        writeln((GFXfont*)&MeltSwashes18, moreBuf, &mx, &my, fb);
+        break;
+      }
+
+      const CalendarEvent& ev = s_events[indices[i]];
+
+      // Alternating row background
+      uint8_t rowBg = (displayed % 2 == 1) ? C_LTGRAY : C_WHITE;
+      if (rowBg == C_LTGRAY) {
+        epd_fill_rect(listX, rowY, listW, DAILY_ROW_H, EPD_LTGRAY, fb);
+      }
+      epd_draw_rect(listX, rowY, listW, DAILY_ROW_H, EPD_LTGRAY, fb);
+
+      // Line 1: time range or "All day"
+      if (ev.allDay) {
+        drawTextColored((GFXfont*)&MeltSwashes18, "All day",
+                        listX + 12, rowY + 24, fb, C_DKGRAY, rowBg);
+      } else {
+        char timeStr[32];
+        formatTimeRange(ev.startHour, ev.startMin, ev.durationMin, timeStr, sizeof(timeStr));
+        drawTextColored((GFXfont*)&MeltSwashes18, timeStr,
+                        listX + 12, rowY + 24, fb, C_DKGRAY, rowBg);
+      }
+
+      // Line 2: title (truncated to fit)
+      char titleFit[64];
+      truncateToFitWidth((GFXfont*)&MeltSwashes16, ev.title, listW - 24,
+                         titleFit, sizeof(titleFit));
+      drawTextColored((GFXfont*)&MeltSwashes16, titleFit,
+                      listX + 12, rowY + 48, fb, C_BLACK, rowBg);
+
+      rowY += DAILY_ROW_H;
+      displayed++;
+    }
   }
 
   drawLeftFooter(fb);

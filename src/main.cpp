@@ -172,13 +172,22 @@ void loop() {
   }
 
   if (needsRender) {
-    display_mgr::powerOn();
-    epd_clear();
-    ui::render();
-    display_mgr::fullRefresh();
-    display_mgr::powerOff();
+    int mode = ui::refreshMode();
+    if (mode == 2) {  // REFRESH_PARTIAL_DAILY
+      ui::render();
+      int dx, dy, dw, dh;
+      ui::getDailyDirtyRect(dx, dy, dw, dh);
+      display_mgr::partialRefresh(dx, dy, dw, dh);
+      Serial.println("[demo] Partial refresh (daily)");
+    } else {
+      display_mgr::powerOn();
+      epd_clear();
+      ui::render();
+      display_mgr::fullRefresh();
+      display_mgr::powerOff();
+      Serial.println("[demo] Rendered screen");
+    }
     needsRender = false;
-    Serial.println("[demo] Rendered screen");
   }
 
   // Heartbeat every 5 seconds — shows touch controller status for debugging.
