@@ -69,11 +69,15 @@ static void syncEventsToUI() {
 }
 
 static void doRender() {
-  // Check if ui has pending changes
-  if (!needsFullRender && !ui::needsRender()) return;
+  // Always consume the UI pending flag so a full render doesn't leave a
+  // stale partial-refresh request for the next loop iteration.
+  bool uiPending = ui::needsRender();
+  if (!needsFullRender && !uiPending) return;
 
   if (needsFullRender) {
-    // Full refresh — screen change, wake, or new data
+    // Full refresh — screen change, wake, or new data. Discard any pending
+    // partial mode so it can't leak into the next render.
+    ui::refreshMode();
     display_mgr::powerOn();
     epd_clear();
     ui::render();
@@ -89,6 +93,12 @@ static void doRender() {
       ui::getDailyDirtyRect(dx, dy, dw, dh);
       display_mgr::partialRefresh(dx, dy, dw, dh);
       Serial.println("[render] Partial refresh (daily)");
+    } else if (mode == 1) {  // REFRESH_PARTIAL_SETTINGS (modal)
+      ui::render();
+      int sx, sy, sw, sh;
+      ui::getSettingsDirtyRect(sx, sy, sw, sh);
+      display_mgr::partialRefresh(sx, sy, sw, sh);
+      Serial.println("[render] Partial refresh (settings)");
     } else {
       display_mgr::powerOn();
       epd_clear();
@@ -112,23 +122,33 @@ static void handleTouch() {
   ui::updateTouch(touched, x, y);
 }
 
+// True if `lt` falls inside the nightly sleep window, which spans midnight
+// (e.g. 22:00 -> 07:00). An inverted/misconfigured window (start <= end) is
+// treated as "no scheduled sleep" so the device can't get stuck sleeping.
+static bool isInSleepWindow(const struct tm& lt) {
+  const settings::Data& cfg = settings::get();
+  return cfg.sleep_start_hour > cfg.sleep_end_hour &&
+         (lt.tm_hour >= cfg.sleep_start_hour || lt.tm_hour < cfg.sleep_end_hour);
+}
+
 static unsigned long calculateSleepMs() {
   time_t now = time(nullptr);
   constexpr time_t MIN_REASONABLE_EPOCH = 1700000000; // 2023-11-14
   if (now < MIN_REASONABLE_EPOCH) {
     return settings::get().refresh_interval_s * 1000UL;
   }
+  const settings::Data& cfg = settings::get();
   struct tm lt; localtime_r(&now, &lt);
-  if (lt.tm_hour >= 22 || lt.tm_hour < 7) {
+  if (isInSleepWindow(lt)) {
     struct tm target = lt;
-    target.tm_hour = 7; target.tm_min = 0; target.tm_sec = 0;
-    if (lt.tm_hour >= 22) target.tm_mday++;
+    target.tm_hour = cfg.sleep_end_hour; target.tm_min = 0; target.tm_sec = 0;
+    if (lt.tm_hour >= cfg.sleep_start_hour) target.tm_mday++;  // evening -> next morning
     time_t targetEpoch = mktime(&target);
     long diffSec = (long)difftime(targetEpoch, now);
     if (diffSec < 60) diffSec = 60;
     return (unsigned long)diffSec * 1000UL;
   }
-  return settings::get().refresh_interval_s * 1000UL;
+  return cfg.refresh_interval_s * 1000UL;
 }
 
 static void enterSleep(const char* reason) {
@@ -255,14 +275,13 @@ void loop() {
     needsFullRender = true;
   }
 
-  // Button cycles between weekly and daily views (active low, debounced)
+  // Button toggles the settings modal (active low, debounced)
   if (digitalRead(config::BUTTON_PIN) == LOW) {
     if (now - lastButtonMs > 300) {
       lastButtonMs = now;
       lastActivityMs = now;
-      ui::next();
-      needsFullRender = true;
-      Serial.println("[button] Toggle view");
+      ui::toggleSettings();
+      Serial.println("[button] Toggle settings");
     }
   }
 
@@ -272,17 +291,20 @@ void loop() {
   // without a fresh timestamp the unsigned subtraction can underflow.
   now = millis();
 
-  // Sleep logic: outside active hours (7am-10pm) sleep until 7am
+  // Sleep logic: inside the configured nightly sleep window, sleep now.
   time_t tnow = time(nullptr);
   constexpr time_t MIN_REASONABLE_EPOCH = 1700000000;
   if (tnow >= MIN_REASONABLE_EPOCH) {
     struct tm lt; localtime_r(&tnow, &lt);
-    if (lt.tm_hour >= 22 || lt.tm_hour < 7) {
+    if (isInSleepWindow(lt)) {
       enterSleep("outside active hours");
     }
   }
 
-  if (now - lastActivityMs > config::INACTIVITY_TIMEOUT_MS) {
+  unsigned long inactivityMs = settings::get().inactivity_timeout_s * 1000UL;
+  if (now - lastActivityMs > inactivityMs) {
+    ui::resetToDefaultView();
+    doRender();
     enterSleep("inactivity timeout");
   }
 

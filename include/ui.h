@@ -12,7 +12,11 @@ enum Screen {
 };
 
 void render();
-void next();
+
+// Toggle the settings modal open/closed (driven by the physical button).
+void toggleSettings();
+// Reset to the default view: weekly, centered on today, no event selected.
+void resetToDefaultView();
 
 // Feed parsed calendar events to the UI. The pointer must remain valid
 // until the next call (ui does not copy the data).

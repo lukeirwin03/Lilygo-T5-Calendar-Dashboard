@@ -19,7 +19,7 @@ All pins and network constants live in [`include/config.h`](include/config.h).
 
 | Env | Purpose | Entry point | WiFi/MQTT | SD card |
 | --- | ------- | ----------- | --------- | ------- |
-| `demo` | UI prototyping with hardcoded test events | `src/main.cpp` | No | No |
+| `demo` | UI prototyping with hardcoded test events | `src/main.cpp` | No | Optional |
 | `dashboard` | Production firmware | `src/main_dashboard.cpp` | Yes | Yes |
 
 ```bash
@@ -54,9 +54,9 @@ Context column features:
 
 ### Daily view
 
-Single-day view with a tear-off calendar widget and event list:
+Single-day view with a tear-off calendar widget, a 3-button nav container, and an event list:
 
-- **Left column**: 220px tear-off calendar (day name + number) + "Back to Week" button
+- **Left column**: 220px tear-off calendar (day name + number) + a **daily nav container** with three buttons: ◀ (previous day), **Back to Week**, and ▶ (next day)
 - **Right column**: Compact 2-line event rows (time range + title, 60px each, alternating stripes)
 - **Tap any event row** → switches the right column to a **detail view** showing full event info (title, time range, location, description, calendar source) with a "← Back to list" button
 - Detail transitions use **partial refresh** (only the right column refreshes, ~2s instead of ~5s full refresh)
@@ -65,24 +65,32 @@ Single-day view with a tear-off calendar widget and event list:
 
 | Action | Weekly view | Daily view |
 | ------ | ----------- | ---------- |
-| Tap left footer arrow | Previous day | Previous day |
-| Tap right footer arrow | Next day | Next day |
-| Tap "Today" button | Jump to today | Jump to today |
 | Tap left context column | Previous day | — |
 | Tap right context column | Next day | — |
 | Tap focus column | Open daily view | — |
+| Tap ◀ / ▶ in daily nav | — | Previous / next day |
 | Tap event row (daily) | — | Open event detail |
 | Tap "← Back to list" | — | Return to event list |
-| Tap "← Back to Week" | — | Return to weekly view |
-| Button press | Toggle daily/weekly | Toggle daily/weekly |
+| Tap "Back to Week" (daily nav) | — | Return to weekly view |
+| Button press | Toggle settings modal | Toggle settings modal |
 
-### Settings (debug-gated)
+> Returning to the weekly view centered on today also happens automatically: on the inactivity sleep timeout the device resets to the weekly-today view before sleeping (replacing the old explicit "Today" jump).
 
-Settings are hidden by default. To access:
-1. **Long-press the battery icon** (≥2 seconds) → toggles debug mode
-2. When debug mode is on, **tap the battery icon** → opens settings screen
-3. Settings: day start/end hour, refresh interval, inactivity timeout, history retention
-4. Network settings (SSID, MQTT host) are displayed but not yet wired to the networking code
+### Settings
+
+Tap the physical button to open the **Settings modal** (tap the button again, or tap **Close** inside the modal, to dismiss). The modal opens as a partial-refresh overlay and shows:
+
+- A **battery readout** at the top
+- A **Display** tab — Day Start, Day End, Time Format (12h/24h)
+- A **Power** tab — Refresh Every, Sleep After, Sleep Starts, Sleep Ends, Keep History
+
+**Time Format (12h/24h)** toggles event times between 12-hour (`3:30 PM`) and 24-hour (`15:30`) display across the weekly and daily views.
+
+**Sleep After** is the inactivity timeout (default 3 minutes): once the device has been idle for that long it resets the display to the weekly-today view, renders it, and goes to deep sleep.
+
+**Sleep Starts / Sleep Ends** define the nightly deep-sleep window (default 10 PM – 7 AM). Outside this window the device skips the normal refresh cycle and sleeps straight through until the end hour. This scheduled window applies to the **dashboard** env only — the **demo** env has no RTC/NTP clock, so it ignores it and still sleeps on the **Sleep After** inactivity timeout.
+
+Changes are persisted to `/config/settings.json` on the SD card when a card is present; otherwise the defaults are used for the session.
 
 ## Sleep / wake cycle
 
@@ -90,7 +98,9 @@ Settings are hidden by default. To access:
 2. **Timer wake** — refresh WiFi/MQTT, render latest data, go back to sleep
 3. **Button/touch wake** — replay cached payload, stay awake for interaction, sleep after inactivity
 
-Active hours: **7 AM – 10 PM**. Outside these hours, the device sleeps immediately.
+Active hours default to **7 AM – 10 PM** (configurable via **Sleep Starts / Sleep Ends**). Outside the configured window, the device sleeps immediately until the end hour.
+
+> The **demo** env mirrors this behavior without networking: it deep-sleeps on the **Sleep After** inactivity timeout and wakes on the button or the refresh timer. (The demo has no RTC/NTP, so there is no active-hours gating.) The GPIO47 → GPIO10 touch-wake bridge described below applies to **both** envs.
 
 ## MQTT model
 
