@@ -1,5 +1,10 @@
 # T5 Calendar Dashboard
 
+> **NOTE (July 2026):** The weekly view has been significantly redesigned
+> (focus+context layout, lane splitting, new typography, event compression).
+> The description below reflects the pre-redesign state.
+> See [`UI_REDESIGN.md`](UI_REDESIGN.md) for the current design and status.
+
 Firmware for a **LilyGo T5 4.7" e-paper (ESP32-S3)** that subscribes to a calendar MQTT topic and renders a **5-day weekly overview** plus a **full-screen daily detail view**. The device spends most of its time in deep sleep and wakes on a timer, a button press, or (with a hardware bridge) touch.
 
 ## Hardware

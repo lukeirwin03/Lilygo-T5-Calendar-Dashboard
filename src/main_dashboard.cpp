@@ -8,6 +8,8 @@
 #include "power_mgr.h"
 #include "touch_input.h"
 #include "battery.h"
+#include "settings.h"
+#include "sd_storage.h"
 
 // ---------------------------------------------------------------------------
 // Dashboard registry — CalendarDashboard handles JSON parsing only.
@@ -70,19 +72,34 @@ static void doRender() {
   // Check if ui has pending changes
   if (!needsFullRender && !ui::needsRender()) return;
 
-  display_mgr::powerOn();
-
-  // Always clear the panel — e-paper retains the previous image, so
-  // skipping this causes new content to layer on top of the old.
-  epd_clear();
-
-  ui::render();
-
-  display_mgr::fullRefresh();
-  display_mgr::powerOff();
+  if (needsFullRender) {
+    // Full refresh — screen change, wake, or new data
+    display_mgr::powerOn();
+    epd_clear();
+    ui::render();
+    display_mgr::fullRefresh();
+    display_mgr::powerOff();
+    Serial.println("[render] Full refresh");
+  } else {
+    // Check for partial refresh mode
+    int mode = ui::refreshMode();
+    if (mode == 2) {  // REFRESH_PARTIAL_DAILY
+      ui::render();
+      int dx, dy, dw, dh;
+      ui::getDailyDirtyRect(dx, dy, dw, dh);
+      display_mgr::partialRefresh(dx, dy, dw, dh);
+      Serial.println("[render] Partial refresh (daily)");
+    } else {
+      display_mgr::powerOn();
+      epd_clear();
+      ui::render();
+      display_mgr::fullRefresh();
+      display_mgr::powerOff();
+      Serial.println("[render] Full refresh");
+    }
+  }
 
   needsFullRender = false;
-  Serial.println("[render] Screen updated");
 }
 
 static void handleTouch() {
@@ -99,7 +116,7 @@ static unsigned long calculateSleepMs() {
   time_t now = time(nullptr);
   constexpr time_t MIN_REASONABLE_EPOCH = 1700000000; // 2023-11-14
   if (now < MIN_REASONABLE_EPOCH) {
-    return config::SCHEDULED_INTERVAL_MS;
+    return settings::get().refresh_interval_s * 1000UL;
   }
   struct tm lt; localtime_r(&now, &lt);
   if (lt.tm_hour >= 22 || lt.tm_hour < 7) {
@@ -111,7 +128,7 @@ static unsigned long calculateSleepMs() {
     if (diffSec < 60) diffSec = 60;
     return (unsigned long)diffSec * 1000UL;
   }
-  return config::SCHEDULED_INTERVAL_MS;
+  return settings::get().refresh_interval_s * 1000UL;
 }
 
 static void enterSleep(const char* reason) {
@@ -139,6 +156,13 @@ void setup() {
   touch_input::begin();
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
+
+  // SD card and settings must be initialized before using configurable values.
+  sd_storage::begin();
+  settings::init();
+
+  // Trim old log files using the user-configurable retention window.
+  sd_storage::cleanOldLogs((int)settings::get().history_retention_d);
 
   power_mgr::WakeReason wake = power_mgr::currentWakeReason();
 

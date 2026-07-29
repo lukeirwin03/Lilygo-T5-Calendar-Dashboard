@@ -62,7 +62,15 @@ void CalendarDashboard::addEvent(const char* title, const char* location,
                                  const char* calendar, const char* type,
                                  const char* startIso, const char* endIso,
                                  bool allDay) {
-  if (eventCount_ >= MAX_EVENTS) return;
+  if (eventCount_ >= MAX_EVENTS) {
+    static bool warned = false;
+    if (!warned) {
+      Serial.printf("[calendar] WARN: MAX_EVENTS (%d) cap hit — '%s' and possibly later events dropped\n",
+                    MAX_EVENTS, title ? title : "?");
+      warned = true;
+    }
+    return;
+  }
 
   int sy, sm, sd, sh, smin;
   int ey, em, ed, eh, emin;
@@ -94,6 +102,10 @@ void CalendarDashboard::addEvent(const char* title, const char* location,
       ev.shade = shadeForCalendar(ev.calendar);
       eventCount_++;
       cur.tm_mday++; mktime(&cur); startEpoch = mktime(&cur);
+    }
+    if (eventCount_ >= MAX_EVENTS && difftime(endEpoch, startEpoch) > 0) {
+      Serial.printf("[calendar] WARN: all-day expansion of '%s' truncated at MAX_EVENTS cap\n",
+                    title ? title : "?");
     }
   } else {
     CalendarEvent& ev = events_[eventCount_];

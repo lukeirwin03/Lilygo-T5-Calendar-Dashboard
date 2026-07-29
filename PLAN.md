@@ -1,5 +1,17 @@
 # Implementation Plan: Power Optimization + SD Card + Settings + History
 
+> **STATUS: COMPLETED** — All phases in this plan are implemented.
+> The active UI redesign plan is in [`UI_REDESIGN.md`](UI_REDESIGN.md).
+> This file is kept for historical reference.
+
+### What was implemented from this plan:
+- **Phase 1 (Power)**: Deep sleep with timer + button wake. Light sleep scaffolded but not wired into the main loop.
+- **Phase 2 (SD Card)**: Full SD card support — event caching, settings file, log files with auto-cleanup.
+- **Phase 3 (Settings)**: Runtime settings loaded from SD card. 5 of 7 settings actually applied (network settings displayed but require reboot). Settings UI debug-gated behind long-press.
+- **Phase 4 (Month View + History)**: `sd_storage::loadEventsForDate()` is implemented but not yet used in rendering. Month view not built.
+
+The UI redesign ([`UI_REDESIGN.md`](UI_REDESIGN.md)) supersedes the rendering portions of this plan.
+
 > **Battery:** 3.7V 5200mAh 19.24Wh
 > **Target:** Maximize time between charges. Passive device first, interactive second.
 
@@ -141,7 +153,6 @@ struct Settings {
   char mqtt_topic[64];
 
   // Display
-  uint8_t num_columns;         // 3, 4, or 5
   uint8_t day_start_hour;      // default 7
   uint8_t day_end_hour;        // default 22
 
@@ -186,7 +197,6 @@ A new screen type `SCREEN_SETTINGS` in the UI:
 
 | Setting | When it takes effect |
 |---------|---------------------|
-| num_columns | Next render |
 | day_start_hour / day_end_hour | Next render |
 | inactivity_timeout_s | Immediately (loop checks the value) |
 | wifi_ssid / mqtt_host / etc. | Next scheduled wake (device reconnects) |

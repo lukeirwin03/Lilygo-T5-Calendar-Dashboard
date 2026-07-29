@@ -1,5 +1,6 @@
 # PlatformIO build artifacts
 .pio
+.venv/
 
 # VS Code — keep extensions.json for collaborator onboarding
 .vscode/*

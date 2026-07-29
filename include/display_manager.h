@@ -10,6 +10,7 @@ namespace display_mgr {
   void powerOn();
   void powerOff();
   void fullRefresh();
+  void partialRefresh(int x, int y, int w, int h);
   void drawSplash(const char* msg);
   uint8_t* framebuffer();
   constexpr int width()  { return EPD_WIDTH; }
