@@ -14,13 +14,6 @@ void log(const char* tag, const char* fmt, ...);
 // Delete log files older than maxDays.
 void cleanOldLogs(int maxDays);
 
-// Persist events grouped by date to /cal/YYYY-MM-DD.json.
-bool saveEvents(const CalendarEvent* events, int count);
-
-// Load events for a specific date from /cal/YYYY-MM-DD.json.
-// Returns the number of events loaded (0 if missing or empty).
-int loadEventsForDate(const char* dateStr, CalendarEvent* out, int maxOut);
-
 // Raw config file read/write used by settings.cpp.
 bool saveConfig(const char* json, size_t len);
 bool loadConfig(char* buf, size_t bufLen);

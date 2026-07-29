@@ -28,7 +28,7 @@ static void initTestEvents() {
   } defs[] = {
     // ===== Day 0 (today) — boundary, pre-range, back-to-back =====
     { "Summer Art Festival",       "Aksarben Village",       "Final project deadline",            0,  0,  0,   0, true,   5 },
-    { "Early morning jog",         "Neighborhood",           "",                                  0,  6, 30,  30, false,  8 },  // pre-7AM: tests "↑ before" indicator
+    { "Early morning jog",         "Neighborhood",           "",                                  0,  6, 30,  30, false,  8 },  // pre-7AM event
     { "Morning standup",           "Slack",                  "Daily team check-in",               0,  9,  0,  30, false,  8 },
     { "Client call",               "Zoom",                   "Quarterly review",                  0, 10,  0,  60, false,  5 },  // back-to-back with Team sync
     { "Team sync",                 "Conference Room",        "Sprint planning",                   0, 11,  0,  60, false, 12 },  // back-to-back with Client call
@@ -40,7 +40,7 @@ static void initTestEvents() {
     { "Vendor call",               "Phone",                  "Contract negotiation",              1, 11,  0,  60, false, 12 },  // triple overlap C
     { "Lunch w/ team",             "Old Market",             "Birthday celebration for Sam",      1, 12,  0,  60, false, 12 },
     { "Deep work workshop",        "Conference Room A",      "Q3 roadmap planning session",       1, 14,  0, 240, false,  5 },  // 4-hour long event
-    { "Late movie",                "Aksarben Theater",       "",                                  1, 22, 30, 120, false,  8 },  // post-10PM: tests "↓ after" indicator
+    { "Late movie",                "Aksarben Theater",       "",                                  1, 22, 30, 120, false,  8 },  // post-10PM event
 
     // ===== Day 2 — very short, boundary end, multi-day start =====
     { "Tech Conference",           "Convention Center",      "Annual tech conference — all 3 days", 2,  0,  0,   0, true,   3 },  // multi-day: days 2, 3, 4

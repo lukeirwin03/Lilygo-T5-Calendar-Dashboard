@@ -16,10 +16,6 @@ void render();
 // Handle a tap at (x, y). Returns what kind of redraw (if any) is required.
 TapResult handleTap(int16_t x, int16_t y);
 
-// Redraw any dirty UI elements. May be a no-op if handleTap already updated
-// the framebuffer; callers use getDirtyRect() to know the refresh region.
-void redrawDirty();
-
 // Populate (x, y, w, h) with the bounding rectangle of the last dirty area.
 void getDirtyRect(int& x, int& y, int& w, int& h);
 

@@ -3,14 +3,11 @@
 #include "display_manager.h"
 #include "battery.h"
 #include "epd_driver.h"
-#include "fonts/Genty20pt7b.h"
 #include "fonts/Genty24pt7b.h"
 #include "fonts/Genty32pt7b.h"
-#include "fonts/Genty48pt7b.h"
 #include "fonts/MeltSwashes14pt7b.h"
 #include "fonts/MeltSwashes16pt7b.h"
 #include "fonts/MeltSwashes18pt7b.h"
-#include "fonts/MeltSwashes20pt7b.h"
 #ifndef ENV_DEMO
 #include "ui_settings.h"
 #include "settings.h"
@@ -44,11 +41,6 @@ static constexpr int WIN_MARGIN     = 12;
 static constexpr int HEADER_H       = 90;
 static constexpr int DAY_START_HOUR = 7;
 static constexpr int DAY_END_HOUR   = 22;
-
-// Phase 10 focus+context layout: 3 columns, focus is 2× the width of context.
-// Computed: total = 2*context + focus + 2*gap = 4*context + 2*gap
-// context_w = (total - 2*gap) / 4
-static constexpr int FOCUS_COL_RATIO = 2;  // focus is N× the context width
 
 static constexpr int EVENT_GAP = 4;  // px of white space between adjacent event blocks
 
@@ -97,9 +89,6 @@ static bool       s_pendingRender = false;
 enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS, REFRESH_PARTIAL_DAILY };
 static RefreshMode s_refreshMode = REFRESH_FULL;
 
-// Last action description for diagnostics.
-static char s_lastAction[128] = "";
-
 // Settings screen tracks the previous touch state so a single tap is handled
 // only on the rising edge of the touch signal.
 static bool s_wasSettingsTouched = false;
@@ -142,12 +131,6 @@ static const char* dayName(int wday) {
 static const char* dayNameShort(int wday) {
   static const char* names[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
   return names[wday % 7];
-}
-
-static const char* monthName(int mon) {
-  static const char* names[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-  return names[mon % 12];
 }
 
 static void getDemoBaseDay(struct tm& out) {
@@ -199,25 +182,6 @@ static int eventsForDate(const char* dateStr, int* outIndices, int maxIndices) {
   return n;
 }
 
-// Returns true if any other event on the same day as `ev` starts strictly
-// after `ev` starts but before `ev` ends. Used to suppress the end-time
-// display when a following event's block would visually collide with the
-// area where the end time would be drawn.
-static bool hasOverlappingFollower(const CalendarEvent& ev) {
-  int evStart = ev.startHour * 60 + ev.startMin;
-  int evEnd = evStart + ev.durationMin;
-  for (int i = 0; i < s_eventCount; i++) {
-    if (i == (&ev - s_events)) continue;  // skip self (pointer arithmetic)
-    if (strcmp(s_events[i].date, ev.date) != 0) continue;
-    if (s_events[i].allDay) continue;
-    int otherStart = s_events[i].startHour * 60 + s_events[i].startMin;
-    if (otherStart > evStart && otherStart < evEnd) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Returns true if there's an all-day event with the given title on the given
 // date (YYYY-MM-DD). Used to detect multi-day event continuation for arrows.
 static bool hasAllDayEventOnDate(const char* dateStr, const char* title) {
@@ -250,16 +214,6 @@ static void formatTimeCompact(int hour, int min, char* buf, size_t len) {
   snprintf(buf, len, "%d:%02d%s", h, min, ampm);
 }
 
-// Compact 24-hour time range: "0900-1000". Saves horizontal space by
-// dropping the colon and AM/PM. Handles midnight wrap via modulo 24.
-static void formatTimeRange24(int startHour, int startMin, int durationMin,
-                               char* buf, size_t len) {
-  int endTotal = startHour * 60 + startMin + durationMin;
-  int eh = (endTotal / 60) % 24;
-  int em = endTotal % 60;
-  snprintf(buf, len, "%02d%02d-%02d%02d", startHour, startMin, eh, em);
-}
-
 // Ultra-compact 12-hour range. Same half: "9:00-10:00AM".
 // Different halves: "11:30A-1:00P". For narrow context columns.
 static void formatTimeRangeUltraCompact(int startHour, int startMin, int durationMin,
@@ -279,11 +233,6 @@ static void formatTimeRangeUltraCompact(int startHour, int startMin, int duratio
     // Different halves — abbreviate each: "11:30A-1:00P"
     snprintf(buf, len, "%d:%02d%c-%d:%02d%c", sh12, startMin, sap[0], eh12, em, eap[0]);
   }
-}
-
-// 24-hour time with colon: "09:00", "14:30". Used in the focus column.
-static void formatTime24Colon(int hour, int min, char* buf, size_t len) {
-  snprintf(buf, len, "%02d:%02d", hour, min);
 }
 
 // Format a time range like "3:30 - 4:00 PM" (compact, same AM/PM) or
@@ -341,18 +290,6 @@ static int eventsForDateLogged(const char* dateStr, int* outIndices, int maxIndi
                   total, dateStr, n);
   }
   return n;
-}
-
-static void truncateWithEllipsis(const char* str, char* out, size_t outLen, int maxChars) {
-  int len = strlen(str);
-  if (len <= maxChars) {
-    strlcpy(out, str, outLen);
-  } else {
-    int keep = maxChars - 3;
-    if (keep < 1) keep = 1;
-    strlcpy(out, str, keep + 1);
-    strlcat(out, "...", outLen);
-  }
 }
 
 // Measure the rendered width of `str` in `font` using get_text_bounds.
@@ -589,20 +526,6 @@ static void drawTextColored(GFXfont* font, const char* str, int x, int y,
   write_mode(font, str, &cx, &cy, fb, BLACK_ON_WHITE, &props);
 }
 
-// Draw a horizontal dotted line at (y) across the column width, centered.
-// Used as a "nothing happening" indicator in gaps between events.
-// `dotColor` is the EPD-shifted shade to draw dots in (typically LTGRAY).
-static void drawGapIndicator(int x, int y, int w, uint8_t dotColor, uint8_t* fb) {
-  // Dotted pattern: 3px dot, 6px gap, repeating
-  int dotW = 3;
-  int gap = 6;
-  int pattern = dotW + gap;
-  int startX = x + (w % pattern) / 2;  // center the pattern
-  for (int dx = 0; dx + dotW <= w; dx += pattern) {
-    epd_fill_rect(startX + dx, y, dotW, 1, dotColor, fb);
-  }
-}
-
 // Draw the all-day event banner as a black rectangle at the top of the timeline.
 // `allDayTitles` is an array of title strings, `allDayTitleCount` is its length.
 // `day` is the current day struct (for computing prev/next-day multi-day arrows).
@@ -730,29 +653,6 @@ static void drawContextList(const int* colIndices, int count,
     entryTop += ENTRY_HEIGHT;
     displayed++;
   }
-}
-
-// Draw a right-pointing triangle as a "now" time indicator inside the focus
-// column. Positioned at the left edge at the Y coordinate matching `nowMin`.
-// White fill with a black outline for visibility on both light and dark blocks.
-static void drawNowMarker(int x, int nowY, uint8_t* fb) {
-  const int triW = 12;
-  const int triH = 10;
-  int halfH = triH / 2;
-  int y = nowY - halfH;
-
-  // White fill using horizontal scan lines.
-  for (int dy = 0; dy < triH; dy++) {
-    int dist = (dy < halfH) ? (halfH - dy) : (dy - halfH);
-    int rowW = triW - (triW * dist) / halfH;
-    if (rowW < 1) rowW = 1;
-    epd_draw_hline(x, y + dy, rowW, EPD_WHITE, fb);
-  }
-
-  // Black outline: top edge, bottom edge, left edge.
-  epd_draw_line(x, y, x + triW, y + halfH, EPD_BLACK, fb);
-  epd_draw_line(x, y + triH - 1, x + triW, y + halfH, EPD_BLACK, fb);
-  epd_draw_line(x, y, x, y + triH - 1, EPD_BLACK, fb);
 }
 
 // Render text with a 1 px black outline around the fg_color fill. Used for
@@ -886,22 +786,6 @@ static int getHeaderY() {
   return winY + winH - WIN_MARGIN / 2 - HEADER_H + 12;
 }
 
-// Focus column extends from cy to near the bottom of the screen.
-// The footer (split into left/right sections) only spans the context columns.
-static void getFocusColumnRect(int& fx, int& fy, int& fw, int& fh) {
-  int cx, cy, cw, ch;
-  getContentRect(cx, cy, cw, ch);
-
-  constexpr int COL_GAP = 8;
-  int contextW = (cw - COL_GAP * 2) / 4;
-  int focusW = contextW * 2;
-
-  fx = cx + contextW + COL_GAP;
-  fy = cy;
-  fw = focusW;
-  fh = (EPD_HEIGHT - 4) - fy;   // 4 px bottom margin
-}
-
 // Left footer section: under the left context column.
 static void getLeftFooterRect(int& lx, int& ly, int& lw, int& lh) {
   int cx, cy, cw, ch;
@@ -956,7 +840,6 @@ static void enterSettings() {
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-  snprintf(s_lastAction, sizeof(s_lastAction), "screen->settings");
 }
 
 static void triggerScreenChange(Screen next, int dayOffset) {
@@ -1097,8 +980,6 @@ static void classifyGesture() {
                 s_startX, s_startY, s_lastX, s_lastY, dx, dy, dur, isTap);
 
   if (!isTap) {
-    snprintf(s_lastAction, sizeof(s_lastAction), "ignored: moved (%d,%d) in %lums",
-             dx, dy, dur);
     return;
   }
 
@@ -1110,15 +991,11 @@ static void classifyGesture() {
     s_pendingRender = true;
     s_refreshMode = REFRESH_FULL;
     s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-    snprintf(s_lastAction, sizeof(s_lastAction),
-             "debug mode %s", s_debugMode ? "ENABLED" : "disabled");
     return;
   }
 #endif
 
   if (dur > TAP_MAX_MS) {
-    snprintf(s_lastAction, sizeof(s_lastAction), "ignored: long press %lums at (%d,%d)",
-             dur, s_startX, s_startY);
     return;
   }
 
@@ -1131,7 +1008,6 @@ static void classifyGesture() {
         s_pendingRender = true;
         s_refreshMode = REFRESH_PARTIAL_DAILY;
         s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-        snprintf(s_lastAction, sizeof(s_lastAction), "daily detail -> list");
         return;
       }
     } else {
@@ -1144,7 +1020,6 @@ static void classifyGesture() {
         s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
         s_awaitingRelease = true;
         s_awaitingReleaseMs = millis();
-        snprintf(s_lastAction, sizeof(s_lastAction), "daily list -> event %d", eventIdx);
         return;
       }
     }
@@ -1177,13 +1052,10 @@ static void classifyGesture() {
     }
     // Today button (left footer) — reset focus to today.
     if (hitTodayButton(s_startX, s_startY)) {
-      int oldOffset = s_baseDayOffset;
       s_baseDayOffset = 0;
       s_pendingRender = true;
       s_refreshMode = REFRESH_FULL;
       s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
-      snprintf(s_lastAction, sizeof(s_lastAction),
-               "today button (was offset %d)", oldOffset);
       return;
     }
     // Gear icon (right footer, between battery and arrow)
@@ -1202,8 +1074,6 @@ static void classifyGesture() {
     }
 
     // Tapped in footer but not on a button
-    snprintf(s_lastAction, sizeof(s_lastAction), "missed: footer tap at (%d,%d)",
-             s_startX, s_startY);
     return;
   }
 
@@ -1213,7 +1083,7 @@ static void classifyGesture() {
     getContentRect(cx, cy, cw, ch);
     if (s_startY >= cy && s_startY <= cy + ch &&
         s_startX >= cx && s_startX <= cx + cw) {
-      // Phase 10: focus+context layout has variable column widths.
+      // focus+context layout has variable column widths.
       // Reconstruct the column index from x position.
       constexpr int COL_GAP = 8;
       int contextW = (cw - COL_GAP * 2) / 4;
@@ -1231,21 +1101,15 @@ static void classifyGesture() {
       if (col == 0) {
         // Left context column = back arrow (focus moves to yesterday's neighbor)
         triggerNav(-1);
-        snprintf(s_lastAction + strlen(s_lastAction), sizeof(s_lastAction) - strlen(s_lastAction),
-                 " [left context -> focus back]");
         return;
       } else if (col == 2) {
         // Right context column = forward arrow
         triggerNav(+1);
-        snprintf(s_lastAction + strlen(s_lastAction), sizeof(s_lastAction) - strlen(s_lastAction),
-                 " [right context -> focus fwd]");
         return;
       } else {
         // col == 1, focus column = open daily view for the focus day
         s_selectedEventIdx = -1;
         triggerScreenChange(SCREEN_DAILY, s_baseDayOffset);
-        snprintf(s_lastAction + strlen(s_lastAction), sizeof(s_lastAction) - strlen(s_lastAction),
-                 " [focus -> daily]");
         return;
       }
     }
@@ -1510,7 +1374,7 @@ static void computeLaneAssignments(const CalendarEvent* events,
 }
 
 // ---------------------------------------------------------------------------
-// Demo 1: focus+context weekly view (3 days)
+// Weekly view (focus+context layout)
 // ---------------------------------------------------------------------------
 static void renderWeeklyView() {
   uint8_t* fb = display_mgr::framebuffer();
@@ -1771,7 +1635,7 @@ static void renderWeeklyView() {
     computeLaneAssignments(s_events, colIndices, colCount, laneAssignments);
 
     // Draw gap indicators between events with a >60 minute time gap.
-    // Each gap gets a faint gray fill and a centered duration label.
+    // Each gap gets a faint gray fill.
     // Drawn before event blocks so events render on top.
     {
       int prevEndMin = -1;
@@ -1910,7 +1774,7 @@ static void renderWeeklyView() {
         continue;  // skip the 2-line rendering below
       }
 
-      // ----- existing 2-line rendering for events > 60 min -----
+      // ----- 2-line rendering for events > 60 min -----
       char timeStr[24];
       formatTimeRange(ev.startHour, ev.startMin, ev.durationMin,
                       timeStr, sizeof(timeStr));
@@ -1982,7 +1846,7 @@ static void renderWeeklyView() {
 }
 
 // ---------------------------------------------------------------------------
-// Demo 2: daily chronological list view
+// Daily view (list + event detail)
 // ---------------------------------------------------------------------------
 static int eventSortKey(const CalendarEvent& ev) {
   if (ev.allDay) return -1;
@@ -2120,7 +1984,7 @@ static void renderDailyView() {
                       listX + 16, detailY, fb, C_DKGRAY, C_WHITE);
       detailY += 24;
       WrappedText wrapped = wrapText((GFXfont*)&MeltSwashes16, ev.description,
-                                      listW - 32, 6);
+                                      listW - 32, 3);
       for (int li = 0; li < wrapped.count; li++) {
         drawTextColored((GFXfont*)&MeltSwashes16, wrapped.lines[li],
                         listX + 16, detailY, fb, C_BLACK, C_WHITE);

@@ -426,16 +426,6 @@ void render() {
   s_entered = true;
 }
 
-// ---------------------------------------------------------------------------
-// Dirty row redraw (for partial refresh)
-// ---------------------------------------------------------------------------
-void redrawDirty() {
-  // redrawDirty is called after row state changes.
-  // The dirty rows have already been redrawn by handleTap via drawSettingRow.
-  // This function is a no-op — the framebuffer is already updated.
-  // The caller uses getDirtyRect() to know what to partial-refresh.
-}
-
 void getDirtyRect(int& x, int& y, int& w, int& h) {
   x = CONTENT_X;
   y = s_dirtyY1;

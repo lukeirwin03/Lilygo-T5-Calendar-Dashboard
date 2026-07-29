@@ -24,8 +24,8 @@ void updateTouch(bool isTouched, int16_t x, int16_t y);
 // Returns true once after a touch interaction changed the UI and needs a redraw.
 bool needsRender();
 
-// Refresh mode requested by the last interaction.
-// 0 = full refresh, 1 = partial refresh of the settings dirty rect.
+// Returns the refresh mode for the pending render.
+// 0 = full refresh, 1 = partial settings refresh, 2 = partial daily refresh.
 int refreshMode();
 
 // Populates the dirty rectangle for a partial settings refresh.

@@ -15,12 +15,7 @@ namespace config {
   constexpr const char*    MQTT_CLIENT_ID = "t5-calendar-dashboard";
   constexpr const char*    MQTT_TOPIC     = "dashboard/calendar";
 
-  // -- Version tag shown in the header --
-  constexpr const char*    VERSION_TAG    = "v2.7";
-
   // -- Power / sleep --
-  // Scheduled data refresh interval (ms). Default 2 hours.
-  constexpr unsigned long SCHEDULED_INTERVAL_MS = 2UL * 60UL * 60UL * 1000UL;
   // Sleep after this many ms of no touch activity while awake.
   constexpr unsigned long INACTIVITY_TIMEOUT_MS = 5UL * 60UL * 1000UL;
   // Hard cap on how long the scheduled wake waits for MQTT payload.

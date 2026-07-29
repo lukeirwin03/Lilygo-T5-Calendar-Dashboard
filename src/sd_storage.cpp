@@ -103,10 +103,19 @@ void log(const char* tag, const char* fmt, ...) {
 void cleanOldLogs(int maxDays) {
   if (!mounted) return;
 
+  // Guard against clock not being set (e.g., cold boot before NTP sync).
+  // Without this, time(nullptr) returns a tiny value, the cutoff underflows,
+  // and ALL log files would be deleted.
+  time_t now = time(nullptr);
+  if (now < 1700000000) {  // before ~Nov 2023
+    Serial.println("[sd] Skipping log cleanup — clock not set");
+    return;
+  }
+
   File dir = SD.open("/logs");
   if (!dir) return;
 
-  time_t cutoff = time(nullptr) - (time_t)maxDays * 86400;
+  time_t cutoff = now - (time_t)maxDays * 86400;
 
   while (true) {
     File entry = dir.openNextFile();
@@ -133,111 +142,6 @@ void cleanOldLogs(int maxDays) {
     }
   }
   dir.close();
-}
-
-// ---------------------------------------------------------------------------
-// Save events — group by date, write one file per date
-// ---------------------------------------------------------------------------
-bool saveEvents(const CalendarEvent* events, int count) {
-  if (!mounted || !events || count <= 0) return false;
-
-  constexpr int MAX_DATES = 32;
-  const char* dates[MAX_DATES];
-  int dateCount = 0;
-
-  int skippedPastCap = 0;
-  for (int i = 0; i < count; i++) {
-    bool found = false;
-    for (int d = 0; d < dateCount; d++) {
-      if (strcmp(dates[d], events[i].date) == 0) { found = true; break; }
-    }
-    if (found) continue;
-    if (dateCount < MAX_DATES) {
-      dates[dateCount++] = events[i].date;
-    } else {
-      skippedPastCap++;
-    }
-  }
-  if (skippedPastCap > 0) {
-    log("SD", "WARN: %d events dropped — %d unique-date cap hit",
-        skippedPastCap, MAX_DATES);
-  }
-
-  for (int d = 0; d < dateCount; d++) {
-    char path[32];
-    snprintf(path, sizeof(path), "/cal/%s.json", dates[d]);
-
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) continue;
-
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-
-    for (int i = 0; i < count; i++) {
-      if (strcmp(events[i].date, dates[d]) != 0) continue;
-
-      JsonObject obj = arr.add<JsonObject>();
-      obj["title"]       = events[i].title;
-      obj["location"]    = events[i].location;
-      obj["description"] = events[i].description;
-      obj["calendar"]    = events[i].calendar;
-      obj["type"]        = events[i].type;
-      obj["startHour"]   = events[i].startHour;
-      obj["startMin"]    = events[i].startMin;
-      obj["durationMin"] = events[i].durationMin;
-      obj["allDay"]      = events[i].allDay;
-      obj["shade"]       = events[i].shade;
-    }
-
-    serializeJson(doc, f);
-    f.close();
-  }
-
-  log("SD", "Saved %d events across %d dates", count, dateCount);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Load events for a specific date
-// ---------------------------------------------------------------------------
-int loadEventsForDate(const char* dateStr, CalendarEvent* out, int maxOut) {
-  if (!mounted || !dateStr || !out || maxOut <= 0) return 0;
-
-  char path[32];
-  snprintf(path, sizeof(path), "/cal/%s.json", dateStr);
-
-  File f = SD.open(path, FILE_READ);
-  if (!f) return 0;
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-
-  if (err) return 0;
-
-  JsonArray arr = doc.as<JsonArray>();
-  int n = 0;
-  for (JsonObject obj : arr) {
-    if (n >= maxOut) break;
-
-    CalendarEvent& ev = out[n];
-    memset(&ev, 0, sizeof(ev));
-    strlcpy(ev.title,       obj["title"]       | "",      sizeof(ev.title));
-    strlcpy(ev.location,    obj["location"]    | "",      sizeof(ev.location));
-    strlcpy(ev.description, obj["description"] | "",      sizeof(ev.description));
-    strlcpy(ev.calendar,    obj["calendar"]    | "",      sizeof(ev.calendar));
-    strlcpy(ev.type,        obj["type"]        | "event", sizeof(ev.type));
-    strlcpy(ev.date,        dateStr,                     sizeof(ev.date));
-    ev.startHour   = obj["startHour"]   | 0;
-    ev.startMin    = obj["startMin"]    | 0;
-    ev.durationMin = obj["durationMin"] | 30;
-    ev.allDay      = obj["allDay"]      | false;
-    ev.shade       = obj["shade"]       | 7;
-    n++;
-  }
-
-  log("SD", "Loaded %d events for %s", n, dateStr);
-  return n;
 }
 
 // ---------------------------------------------------------------------------
