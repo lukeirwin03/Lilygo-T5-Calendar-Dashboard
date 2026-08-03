@@ -123,6 +123,40 @@ Every MQTT payload is persisted to the SD card so the device works without a net
 
 The RTC RAM cache (used for instant replay on button wakes) is the fast path; the SD card is the persistent fallback that survives power loss.
 
+## Power management
+
+The device is designed for battery operation — it spends most of its time in deep sleep (~10–150 µA) and wakes only when needed. The e-paper display retains its image with zero current between refreshes.
+
+### Sleep scheduling
+- **Event-aware wakes** — wakes 10 minutes before the next upcoming event so the display is fresh.
+- **Periodic fallback** — wakes at most every **Refresh Every** interval (default 2h) to discover newly-added events.
+- **Sleep window** — during the nightly window (default 10 PM–7 AM), sleeps straight through to morning. Timer wakes inside the window skip WiFi entirely.
+- **Inactivity timeout** — sleeps after **Sleep After** seconds (default 180) of no interaction.
+
+### WiFi
+- WiFi is **off during touch interaction** — disconnected after the data fetch and never reconnected.
+- **Early disconnect** — on timer wakes, WiFi is turned off the instant the MQTT payload arrives, before the ~5s render.
+- **Reduced TX power** — limited to 17 dBm (from the default ~20 dBm), reducing peak current during WiFi active periods.
+
+### CPU
+- Runs at **160 MHz** (down from the default 240 MHz), cutting active power ~30%. The EPD driver uses its own SPI clock and is unaffected.
+
+### Display
+- **E-paper (bistable)** — zero current between refreshes.
+- **Partial refresh** for daily↔detail transitions and the settings modal (~2s vs ~5s full).
+- Display power cut after every refresh cycle.
+
+### Battery
+- **Sampled on demand** — voltage read only on cold boot and button wake (when someone might look), not on every timer wake.
+
+### Memory
+- **Event window** — only events within the next 12 days are loaded into memory. Events outside the window are still persisted to the SD card history but not held in RAM.
+
+### Future opportunities
+- **Light sleep during interaction** — replace the touch-poll loop with GPIO-interrupt wake from light sleep (~1–5 mA vs ~80 mA active). Biggest remaining win for battery life.
+- **Static IP** — skip DHCP negotiation (~1–2s savings per WiFi connect).
+- **Low-battery conservation** — increase sleep intervals when battery is low.
+
 ## MQTT model
 
 ```

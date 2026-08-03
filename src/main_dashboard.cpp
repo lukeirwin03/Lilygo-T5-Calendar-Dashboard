@@ -254,6 +254,7 @@ static void enterSleep(const char* reason) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  setCpuFrequencyMhz(160);  // save ~30% active power vs default 240 MHz
   // The RTC keeps UTC across deep sleep, but the C library timezone state
   // (set by configTzTime) lives in RAM and is lost on wake. Re-apply the
   // timezone before any localtime_r call so sleep-window checks are correct.
@@ -266,7 +267,13 @@ void setup() {
     while (1) delay(1000);
   }
 
-  battery::sample();
+  power_mgr::WakeReason wake = power_mgr::currentWakeReason();
+
+  // Battery level changes slowly — only sample when someone might look at it
+  // (cold boot or button wake). Skip on timer wakes to save ADC power.
+  if (wake != power_mgr::WAKE_TIMER) {
+    battery::sample();
+  }
   touch_input::begin();
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
@@ -279,10 +286,8 @@ void setup() {
   sd_storage::cleanOldLogs((int)settings::get().history_retention_d);
   sd_storage::cleanOldHistory((int)settings::get().history_retention_d);
 
-  power_mgr::WakeReason wake = power_mgr::currentWakeReason();
-
   // -------------------------------------------------------------------------
-  // COLD BOOT → connect WiFi, MQTT, fetch fresh data, render
+  // COLD BOOT → SD-first render, then WiFi/MQTT background refresh
   // -------------------------------------------------------------------------
   if (wake == power_mgr::WAKE_COLD_BOOT) {
     // --- SD-first: show cached data immediately if the RTC clock is valid ---

@@ -157,6 +157,7 @@ bool dispatchPayload(const char* payload, size_t length) {
 void connectWiFi() {
   Serial.printf("[wifi] Connecting to %s...\n", config::WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_17dBm);  // reduce peak TX current (~50-100 mA savings)
   WiFi.begin(config::WIFI_SSID, config::WIFI_PASSWORD);
 
   int attempts = 0;
