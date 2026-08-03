@@ -22,6 +22,9 @@ namespace config {
   constexpr unsigned long PAYLOAD_WAIT_MS = 8000;
   // SNTP sync timeout on cold boot.
   constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
+  // Wake this many seconds before an event starts, giving the display time to
+  // refresh so upcoming events appear with a comfortable lead.
+  constexpr unsigned long EVENT_WAKE_LEAD_S = 600;  // 10 minutes
 
   // -- Hardware pins (LilyGo T5 4.7" S3) --
   // These match the official LilyGo-EPD47 utilities.h for ESP32-S3.
