@@ -1,6 +1,7 @@
 #include "networking.h"
 #include "config.h"
 #include "dashboard.h"
+#include "sd_storage.h"
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -22,6 +23,9 @@ static PubSubClient mqtt(wifiClient);
 static constexpr size_t RTC_PAYLOAD_CAP = 4096;
 RTC_DATA_ATTR static char  rtcPayload[RTC_PAYLOAD_CAP];
 RTC_DATA_ATTR static size_t rtcPayloadLen = 0;
+// Checksum of the last payload appended to history — survives deep sleep
+// so we can dedup across wakes.
+RTC_DATA_ATTR static uint32_t lastHistoryChecksum = 0;
 
 // -- Helpers ------------------------------------------------------------------
 
@@ -38,6 +42,27 @@ static const char* mqttStateName(int state) {
     case  4: return "BAD_CREDENTIALS";
     case  5: return "UNAUTHORIZED";
     default: return "UNKNOWN";
+  }
+}
+
+// Simple FNV-like hash for payload dedup. Collisions are astronomically
+// unlikely for calendar data and harmless (worst case: one missed entry).
+static uint32_t payloadChecksum(const char* data, size_t len) {
+  uint32_t h = (uint32_t)len;
+  for (size_t i = 0; i < len; i++) h = h * 31 + (uint8_t)data[i];
+  return h;
+}
+
+// Persist the raw payload to SD (cache + deduped history).
+static void persistPayload(const char* payload, size_t length) {
+  // Don't cache payloads too large to replay from the fixed-size buffer.
+  if (length >= RTC_PAYLOAD_CAP) return;
+  sd_storage::savePayload(payload, length);
+
+  uint32_t checksum = payloadChecksum(payload, length);
+  if (checksum != lastHistoryChecksum) {
+    lastHistoryChecksum = checksum;
+    sd_storage::appendHistory(payload, length);
   }
 }
 
@@ -86,6 +111,10 @@ static void onMessage(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
+  // Persist valid payload to SD card (survives power loss, enables SD-first
+  // boot + deduped history). Only reached after successful JSON parse.
+  persistPayload((const char*)payload, length);
+
   // Debug: show what keys we got
   Serial.printf("[mqtt] JSON keys: ");
   JsonObject root = doc.as<JsonObject>();
@@ -110,6 +139,20 @@ static void onMessage(char* topic, byte* payload, unsigned int length) {
 }
 
 // -- Public API ---------------------------------------------------------------
+
+// Dispatch a raw JSON payload to the first dashboard. Used for live MQTT
+// messages, RTC-RAM replay, and SD-cache replay.
+bool dispatchPayload(const char* payload, size_t length) {
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.printf("[mqtt] Payload parse error: %s\n", err.c_str());
+    return false;
+  }
+  if (NUM_DASHBOARDS == 0) return false;
+  dispatchDoc(dashboards[0]->topic(), doc);
+  return true;
+}
 
 void connectWiFi() {
   Serial.printf("[wifi] Connecting to %s...\n", config::WIFI_SSID);
@@ -260,22 +303,39 @@ bool pumpForPayload(unsigned long timeoutMs) {
 
 bool replayCachedPayload() {
   if (rtcPayloadLen == 0) return false;
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, rtcPayload, rtcPayloadLen);
-  if (err) {
-    Serial.printf("[mqtt] Cached payload parse error: %s\n", err.c_str());
-    return false;
-  }
-
-  // All dashboards share the same topic in this firmware. Dispatch by
-  // walking the registry and matching topics — same logic as live MQTT.
-  // Use the first dashboard's topic as the canonical key.
-  if (NUM_DASHBOARDS == 0) return false;
-  const char* topic = dashboards[0]->topic();
-  dispatchDoc(topic, doc);
-  Serial.printf("[mqtt] Replayed %u cached bytes\n", (unsigned)rtcPayloadLen);
+  if (!dispatchPayload(rtcPayload, rtcPayloadLen)) return false;
+  Serial.printf("[mqtt] Replayed %u RTC-cached bytes\n", (unsigned)rtcPayloadLen);
   return true;
+}
+
+bool replaySDPayload() {
+  if (!sd_storage::isMounted()) return false;
+  static char buf[RTC_PAYLOAD_CAP];
+  size_t len = sd_storage::loadPayload(buf, sizeof(buf));
+  if (len == 0) return false;
+  if (!dispatchPayload(buf, len)) return false;
+  Serial.printf("[mqtt] Replayed %u SD-cached bytes\n", (unsigned)len);
+  return true;
+}
+
+bool pumpForFreshPayload(unsigned long timeoutMs) {
+  Serial.printf("[mqtt] Pumping for fresh payload (timeout=%lu ms)...\n", timeoutMs);
+  // Reset dirty flags so we only detect messages arriving during this call.
+  for (size_t i = 0; i < NUM_DASHBOARDS; i++) dashboards[i]->dirty = false;
+
+  const unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    mqtt.loop();
+    for (size_t i = 0; i < NUM_DASHBOARDS; i++) {
+      if (dashboards[i]->dirty) {
+        Serial.printf("[mqtt] Fresh payload after %lu ms\n", millis() - start);
+        return true;
+      }
+    }
+    delay(20);
+  }
+  Serial.printf("[mqtt] No fresh payload after %lu ms\n", timeoutMs);
+  return false;
 }
 
 bool hasCachedPayload() { return rtcPayloadLen > 0; }
