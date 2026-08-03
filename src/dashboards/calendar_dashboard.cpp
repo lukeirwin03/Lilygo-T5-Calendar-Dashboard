@@ -137,6 +137,25 @@ void CalendarDashboard::dumpParsedEvents() const {
 
 void CalendarDashboard::handlePayload(JsonDocument& doc) {
   clearData();
+
+  // Only load events within a forward window into memory. Events outside the
+  // window are still persisted to SD (via the caller's persistPayload) but not
+  // held in RAM — saves memory and speeds up rendering/scheduling.
+  time_t now = time(nullptr);
+  bool clockValid = (now >= 1700000000);
+  time_t windowStart = 0;
+  time_t windowEnd = 0;
+  if (clockValid) {
+    struct tm todayTm;
+    localtime_r(&now, &todayTm);
+    todayTm.tm_hour = 0;
+    todayTm.tm_min = 0;
+    todayTm.tm_sec = 0;
+    windowStart = mktime(&todayTm);
+    windowEnd = windowStart + (time_t)config::MAX_EVENT_WINDOW_DAYS * 86400;
+  }
+
+  int skippedCount = 0;
   JsonArray arr = doc["events"];
   if (!arr.isNull()) {
     for (JsonObject ev : arr) {
@@ -150,12 +169,30 @@ void CalendarDashboard::handlePayload(JsonDocument& doc) {
       bool allDay             = ev["all_day"]     | false;
       if (!start[0]) continue;
       if (!end[0]) end = start;
+
+      // Skip events outside the memory window (only when clock is valid).
+      if (clockValid) {
+        int y, m, d, h, min;
+        parseIsoDateTime(start, y, m, d, h, min);
+        struct tm evTm;
+        memset(&evTm, 0, sizeof(evTm));
+        evTm.tm_year = y - 1900;
+        evTm.tm_mon = m - 1;
+        evTm.tm_mday = d;
+        evTm.tm_isdst = -1;
+        time_t evDate = mktime(&evTm);
+        if (evDate < windowStart || evDate >= windowEnd) {
+          skippedCount++;
+          continue;
+        }
+      }
+
       addEvent(title, location, description, calendar, type, start, end, allDay);
     }
   }
   hasData = true; dirty = true;
-  Serial.printf("[calendar] Parsed %d raw events -> %d entries\n",
-                (int)arr.size(), eventCount_);
+  Serial.printf("[calendar] Parsed %d events (%d outside %d-day window) -> %d entries\n",
+                (int)arr.size(), skippedCount, config::MAX_EVENT_WINDOW_DAYS, eventCount_);
 #ifdef CORE_DEBUG_LEVEL
   #if CORE_DEBUG_LEVEL >= 4
     dumpParsedEvents();

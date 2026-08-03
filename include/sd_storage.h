@@ -18,4 +18,15 @@ void cleanOldLogs(int maxDays);
 bool saveConfig(const char* json, size_t len);
 bool loadConfig(char* buf, size_t bufLen);
 
+// Raw calendar payload cache (/cal/current.json) — persists across power loss.
+bool savePayload(const char* json, size_t len);
+size_t loadPayload(char* buf, size_t bufLen);
+
+// Append a payload snapshot to the daily history file
+// (/cal/history/YYYY-MM-DD.jsonl) in JSONL format.
+void appendHistory(const char* payload, size_t length);
+
+// Delete history files older than maxDays.
+void cleanOldHistory(int maxDays);
+
 } // namespace sd_storage

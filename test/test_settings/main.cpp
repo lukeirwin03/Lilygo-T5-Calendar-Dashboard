@@ -4,8 +4,10 @@
 // Value arrays (duplicated from ui_settings.cpp)
 static const int startValues[] = {5, 6, 7, 8, 9};
 static const int endValues[] = {20, 21, 22, 23};
+static const int sleepStartValues[] = {20, 21, 22, 23};
+static const int sleepEndValues[]   = {5, 6, 7, 8, 9};
 static const uint32_t refreshValues[] = {1800, 3600, 7200, 14400, 21600};
-static const uint32_t inactivityValues[] = {15, 30, 45, 60, 120, 300};
+static const uint32_t inactivityValues[] = {60, 120, 180, 300, 600};
 static const uint32_t retentionValues[] = {30, 90, 180, 365};
 
 // Cycle helper (same logic as ui_settings::cycleSetting)
@@ -31,9 +33,9 @@ void test_refresh_values(void) {
 }
 
 void test_inactivity_values(void) {
-  TEST_ASSERT_EQUAL(30, cycleValue(inactivityValues, 6, (uint32_t)15, +1));
-  TEST_ASSERT_EQUAL(15, cycleValue(inactivityValues, 6, (uint32_t)300, +1));  // wraps
-  TEST_ASSERT_EQUAL(300, cycleValue(inactivityValues, 6, (uint32_t)15, -1));  // wraps back
+  TEST_ASSERT_EQUAL(120, cycleValue(inactivityValues, 5, (uint32_t)60, +1));
+  TEST_ASSERT_EQUAL(60, cycleValue(inactivityValues, 5, (uint32_t)600, +1));  // wraps
+  TEST_ASSERT_EQUAL(600, cycleValue(inactivityValues, 5, (uint32_t)60, -1));  // wraps back
 }
 
 void test_retention_values(void) {
@@ -41,32 +43,48 @@ void test_retention_values(void) {
   TEST_ASSERT_EQUAL(30, cycleValue(retentionValues, 4, (uint32_t)365, +1));  // wraps
 }
 
+void test_sleep_start_cycle(void) {
+  TEST_ASSERT_EQUAL(21, cycleValue(sleepStartValues, 4, 20, +1));
+  TEST_ASSERT_EQUAL(20, cycleValue(sleepStartValues, 4, 23, +1));  // wraps
+  TEST_ASSERT_EQUAL(23, cycleValue(sleepStartValues, 4, 20, -1));  // wraps back
+}
+
+void test_sleep_end_cycle(void) {
+  TEST_ASSERT_EQUAL(6, cycleValue(sleepEndValues, 5, 5, +1));
+  TEST_ASSERT_EQUAL(5, cycleValue(sleepEndValues, 5, 9, +1));   // wraps
+  TEST_ASSERT_EQUAL(9, cycleValue(sleepEndValues, 5, 5, -1));   // wraps back
+}
+
 // Settings Data struct layout test
 struct Data {
   uint8_t  day_start_hour;
   uint8_t  day_end_hour;
+  bool     time_format_24h;
   uint32_t refresh_interval_s;
   uint32_t inactivity_timeout_s;
+  uint8_t  sleep_start_hour;
+  uint8_t  sleep_end_hour;
   uint32_t history_retention_d;
-  char     wifi_ssid[33];
-  char     wifi_password[65];
-  char     mqtt_host[64];
-  uint16_t mqtt_port;
-  char     mqtt_topic[64];
 };
 
 void test_settings_struct_defaults(void) {
   Data d = {};
   d.day_start_hour = 7;
   d.day_end_hour = 22;
+  d.time_format_24h = false;
   d.refresh_interval_s = 7200;
-  d.inactivity_timeout_s = 45;
+  d.inactivity_timeout_s = 180;
+  d.sleep_start_hour = 22;
+  d.sleep_end_hour = 7;
   d.history_retention_d = 365;
 
   TEST_ASSERT_EQUAL(7, d.day_start_hour);
   TEST_ASSERT_EQUAL(22, d.day_end_hour);
+  TEST_ASSERT_EQUAL(false, d.time_format_24h);
   TEST_ASSERT_EQUAL(7200, d.refresh_interval_s);
-  TEST_ASSERT_EQUAL(45, d.inactivity_timeout_s);
+  TEST_ASSERT_EQUAL(180, d.inactivity_timeout_s);
+  TEST_ASSERT_EQUAL(22, d.sleep_start_hour);
+  TEST_ASSERT_EQUAL(7, d.sleep_end_hour);
   TEST_ASSERT_EQUAL(365, d.history_retention_d);
 }
 
@@ -74,6 +92,8 @@ int main() {
   UNITY_BEGIN();
 
   RUN_TEST(test_start_hour_cycle);
+  RUN_TEST(test_sleep_start_cycle);
+  RUN_TEST(test_sleep_end_cycle);
   RUN_TEST(test_refresh_values);
   RUN_TEST(test_inactivity_values);
   RUN_TEST(test_retention_values);

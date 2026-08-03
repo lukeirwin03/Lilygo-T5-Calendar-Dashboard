@@ -6,10 +6,12 @@
 #include "touch_input.h"
 #include "power_mgr.h"
 #include "dashboards/calendar_dashboard.h"
+#include "settings.h"
+#include "sd_storage.h"
 
 static unsigned long lastButtonMs = 0;
 static unsigned long lastHeartbeatMs = 0;
-static bool needsRender = true;
+static unsigned long lastActivityMs = 0;
 
 static CalendarEvent testEvents[28];
 static const int TEST_EVENT_COUNT = 26;
@@ -116,6 +118,7 @@ static void handleTouch() {
   if (touched) {
     bool gotPoint = touch_input::poll(x, y);
     if (gotPoint) {
+      lastActivityMs = millis();
       Serial.printf("[touch] x=%d y=%d\n", x, y);
     } else {
       // INT is LOW (touched=true) but GT911 returned no point data.
@@ -131,6 +134,7 @@ static void handleTouch() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  setCpuFrequencyMhz(160);  // save ~30% active power vs default 240 MHz
   logBootInfo();
 
   if (!display_mgr::begin()) {
@@ -147,47 +151,66 @@ void setup() {
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
 
+  sd_storage::begin();
+  settings::init();
+
   initTestEvents();
   ui::setEvents(testEvents, TEST_EVENT_COUNT);
 
-  needsRender = true;
+  lastActivityMs = millis();
+}
+
+static void doRender() {
+  int mode = ui::refreshMode();
+  if (mode == 2) {  // REFRESH_PARTIAL_DAILY
+    ui::render();
+    int dx, dy, dw, dh;
+    ui::getDailyDirtyRect(dx, dy, dw, dh);
+    display_mgr::partialRefresh(dx, dy, dw, dh);
+    Serial.println("[demo] Partial refresh (daily)");
+  } else if (mode == 1) {  // REFRESH_PARTIAL_SETTINGS (modal)
+    ui::render();
+    int sx, sy, sw, sh;
+    ui::getSettingsDirtyRect(sx, sy, sw, sh);
+    display_mgr::partialRefresh(sx, sy, sw, sh);
+    Serial.println("[demo] Partial refresh (settings)");
+  } else {
+    display_mgr::powerOn();
+    epd_clear();
+    ui::render();
+    display_mgr::fullRefresh();
+    display_mgr::powerOff();
+    Serial.println("[demo] Rendered screen");
+  }
+}
+
+static void enterSleep(const char* reason) {
+  unsigned long sleepMs = settings::get().refresh_interval_s * 1000UL;
+  Serial.printf("[demo sleep] %s — deep sleep for %lu ms\n", reason, sleepMs);
+  touch_input::sleep();
+  delay(50);
+  power_mgr::sleepFor(sleepMs);  // never returns
 }
 
 void loop() {
   unsigned long now = millis();
 
   handleTouch();
-  if (ui::needsRender()) {
-    needsRender = true;
-  }
 
-  // Button cycles demo screens
+  // Button toggles the settings modal (active low, debounced)
   if (digitalRead(config::BUTTON_PIN) == LOW) {
     if (now - lastButtonMs > 300) {
       lastButtonMs = now;
-      ui::next();
-      needsRender = true;
-      Serial.println("[demo] Button -> next screen");
+      lastActivityMs = now;
+      ui::toggleSettings();
+      Serial.println("[demo] Button -> toggle settings");
     }
   }
 
-  if (needsRender) {
-    int mode = ui::refreshMode();
-    if (mode == 2) {  // REFRESH_PARTIAL_DAILY
-      ui::render();
-      int dx, dy, dw, dh;
-      ui::getDailyDirtyRect(dx, dy, dw, dh);
-      display_mgr::partialRefresh(dx, dy, dw, dh);
-      Serial.println("[demo] Partial refresh (daily)");
-    } else {
-      display_mgr::powerOn();
-      epd_clear();
-      ui::render();
-      display_mgr::fullRefresh();
-      display_mgr::powerOff();
-      Serial.println("[demo] Rendered screen");
-    }
-    needsRender = false;
+  // Render once if the UI has pending changes (from a touch gesture or button).
+  // This consumes the UI pending flag exactly once, after all input is processed.
+  if (ui::needsRender()) {
+    doRender();
   }
 
   // Heartbeat every 5 seconds — shows touch controller status for debugging.
@@ -197,6 +220,17 @@ void loop() {
                   touch_input::isOnline(),
                   digitalRead(config::TOUCH_INT_PIN),
                   ESP.getFreeHeap());
+  }
+
+  // Re-read the clock after rendering (render takes seconds).
+  now = millis();
+
+  // Deep sleep on inactivity (demo has no RTC/NTP, so no active-hours gating).
+  unsigned long inactivityMs = settings::get().inactivity_timeout_s * 1000UL;
+  if (now - lastActivityMs > inactivityMs) {
+    ui::resetToDefaultView();
+    doRender();
+    enterSleep("inactivity timeout");
   }
 
   delay(10);

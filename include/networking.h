@@ -26,4 +26,18 @@ namespace networking {
 
   // True if any payload is currently cached in RTC RAM.
   bool hasCachedPayload();
+
+  // Dispatch a raw JSON payload through the dashboard pipeline.
+  // Used for replaying the SD-cached payload on boot.
+  bool dispatchPayload(const char* payload, size_t length);
+
+  // Load and dispatch the SD-cached payload. Returns false if no cache
+  // exists or the card isn't mounted.
+  bool replaySDPayload();
+
+  // Like pumpForPayload, but waits for a NEW message even if dashboards
+  // already have cached data. Clears dirty flags first, then pumps until
+  // a fresh payload arrives or timeout. Used on cold boot when cache was
+  // already loaded from SD.
+  bool pumpForFreshPayload(unsigned long timeoutMs);
 }
