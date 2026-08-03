@@ -134,6 +134,7 @@ static void handleTouch() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  setCpuFrequencyMhz(160);  // save ~30% active power vs default 240 MHz
   logBootInfo();
 
   if (!display_mgr::begin()) {

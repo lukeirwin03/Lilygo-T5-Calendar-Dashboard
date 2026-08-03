@@ -38,6 +38,7 @@ bool begin() {
                 (double)SD.cardSize() / (1024 * 1024));
 
   SD.mkdir("/cal");
+  SD.mkdir("/cal/history");
   SD.mkdir("/config");
   SD.mkdir("/logs");
 
@@ -100,19 +101,18 @@ void log(const char* tag, const char* fmt, ...) {
   }
 }
 
-void cleanOldLogs(int maxDays) {
+// Shared age-based cleanup for /logs and /cal/history.
+static void cleanOldFiles(const char* dirPath, int maxDays, const char* tag) {
   if (!mounted) return;
 
-  // Guard against clock not being set (e.g., cold boot before NTP sync).
-  // Without this, time(nullptr) returns a tiny value, the cutoff underflows,
-  // and ALL log files would be deleted.
+  // Guard against clock not being set (cold boot before NTP sync).
   time_t now = time(nullptr);
-  if (now < 1700000000) {  // before ~Nov 2023
-    Serial.println("[sd] Skipping log cleanup — clock not set");
+  if (now < 1700000000) {
+    Serial.println("[sd] Skipping cleanup — clock not set");
     return;
   }
 
-  File dir = SD.open("/logs");
+  File dir = SD.open(dirPath);
   if (!dir) return;
 
   time_t cutoff = now - (time_t)maxDays * 86400;
@@ -123,7 +123,7 @@ void cleanOldLogs(int maxDays) {
     String name = entry.name();
     entry.close();
 
-    // Parse date from filename: YYYY-MM-DD.log
+    // Parse date from filename: YYYY-MM-DD.log or YYYY-MM-DD.jsonl
     if (name.length() < 14) continue;
     int y, m, d;
     if (sscanf(name.c_str(), "%d-%d-%d", &y, &m, &d) != 3) continue;
@@ -135,13 +135,21 @@ void cleanOldLogs(int maxDays) {
     time_t fileTime = mktime(&ft);
 
     if (fileTime < cutoff) {
-      char path[40];
-      snprintf(path, sizeof(path), "/logs/%s", name.c_str());
+      char path[64];
+      snprintf(path, sizeof(path), "%s/%s", dirPath, name.c_str());
       SD.remove(path);
-      Serial.printf("[sd] Deleted old log: %s\n", name.c_str());
+      Serial.printf("[sd] Deleted old %s: %s\n", tag, name.c_str());
     }
   }
   dir.close();
+}
+
+void cleanOldLogs(int maxDays) {
+  cleanOldFiles("/logs", maxDays, "log");
+}
+
+void cleanOldHistory(int maxDays) {
+  cleanOldFiles("/cal/history", maxDays, "history");
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +177,64 @@ bool loadConfig(char* buf, size_t bufLen) {
   buf[bytesRead] = '\0';
   f.close();
   return bytesRead > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Calendar payload cache + history
+// ---------------------------------------------------------------------------
+bool savePayload(const char* json, size_t len) {
+  if (!mounted) return false;
+  File f = SD.open("/cal/current.json", FILE_WRITE);
+  if (!f) return false;
+  f.write((const uint8_t*)json, len);
+  f.close();
+  return true;
+}
+
+size_t loadPayload(char* buf, size_t bufLen) {
+  if (!mounted) return 0;
+  File f = SD.open("/cal/current.json", FILE_READ);
+  if (!f) return 0;
+  size_t bytesRead = f.readBytes(buf, bufLen - 1);
+  buf[bytesRead] = '\0';
+  f.close();
+  return bytesRead;
+}
+
+void appendHistory(const char* payload, size_t length) {
+  if (!mounted) return;
+
+  // Build timestamp and date-for-filename.
+  char ts[32];
+  char datePart[16];
+  time_t now = time(nullptr);
+  if (now > 1700000000) {
+    struct tm lt;
+    localtime_r(&now, &lt);
+    snprintf(ts, sizeof(ts), "%04d-%02d-%02dT%02d:%02d:%02d",
+             lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+             lt.tm_hour, lt.tm_min, lt.tm_sec);
+    snprintf(datePart, sizeof(datePart), "%04d-%02d-%02d",
+             lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+  } else {
+    strcpy(ts, "epoch+0");
+    strcpy(datePart, "boot");
+  }
+
+  SD.mkdir("/cal/history");
+  char path[48];
+  snprintf(path, sizeof(path), "/cal/history/%s.jsonl", datePart);
+
+  File f = SD.open(path, FILE_APPEND);
+  if (!f) return;
+
+  // JSONL line: {"ts":"...","payload":<raw JSON>}
+  f.print("{\"ts\":\"");
+  f.print(ts);
+  f.print("\",\"payload\":");
+  f.write((const uint8_t*)payload, length);
+  f.println("}");
+  f.close();
 }
 
 } // namespace sd_storage

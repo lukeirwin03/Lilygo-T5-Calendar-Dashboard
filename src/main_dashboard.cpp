@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <time.h>
 #include "config.h"
 #include "display_manager.h"
 #include "dashboards/calendar_dashboard.h"
@@ -29,6 +30,8 @@ static unsigned long lastActivityMs = 0;
 static unsigned long lastHeartbeatMs = 0;
 static bool needsFullRender = true;
 static unsigned long lastButtonMs = 0;
+// Earliest plausible epoch — used to detect an unset clock (pre-NTP).
+static constexpr time_t MIN_REASONABLE_EPOCH = 1700000000;  // 2023-11-14
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -110,6 +113,7 @@ static void doRender() {
   }
 
   needsFullRender = false;
+  calendarDash.dirty = false;  // a render consumes any pending "new data" flag
 }
 
 static void handleTouch() {
@@ -131,24 +135,109 @@ static bool isInSleepWindow(const struct tm& lt) {
          (lt.tm_hour >= cfg.sleep_start_hour || lt.tm_hour < cfg.sleep_end_hour);
 }
 
+// Milliseconds until the sleep window ends (e.g. until 7 AM). `lt` must be the
+// local-time breakdown of `now`, and the window must be valid (start > end).
+static unsigned long sleepUntilWindowEndMs(time_t now, const struct tm& lt) {
+  const settings::Data& cfg = settings::get();
+  struct tm target = lt;
+  target.tm_hour = cfg.sleep_end_hour;
+  target.tm_min = 0;
+  target.tm_sec = 0;
+  if (lt.tm_hour >= cfg.sleep_start_hour) target.tm_mday++;  // evening -> next morning
+  time_t targetEpoch = mktime(&target);
+  long diffSec = (long)difftime(targetEpoch, now);
+  if (diffSec < 60) diffSec = 60;
+  return (unsigned long)diffSec * 1000UL;
+}
+
+// Milliseconds until the sleep window starts (e.g. until 10 PM today).
+// Caller must ensure a valid window (start > end) before calling.
+static unsigned long msUntilWindowStart(time_t now, const struct tm& lt) {
+  const settings::Data& cfg = settings::get();
+  struct tm target = lt;
+  target.tm_hour = cfg.sleep_start_hour;
+  target.tm_min = 0;
+  target.tm_sec = 0;
+  time_t targetEpoch = mktime(&target);
+  long diffSec = (long)difftime(targetEpoch, now);
+  if (diffSec < 0) diffSec += 24 * 3600;  // window start already passed; it's tomorrow
+  return (unsigned long)diffSec * 1000UL;
+}
+
+// Earliest start epoch of a future, non-all-day event whose scheduled wake-up
+// (start minus lead time) is still ahead of `now`. Returns 0 if none.
+// All-day events are skipped — they have no meaningful "about to start" moment
+// and are caught by the periodic fallback.
+static time_t nextEventStartAfter(time_t now) {
+  time_t best = 0;
+  for (int i = 0; i < calendarDash.eventCount(); i++) {
+    const CalendarEvent& ev = calendarDash.events()[i];
+    if (ev.allDay) continue;
+
+    int y, m, d;
+    if (sscanf(ev.date, "%d-%d-%d", &y, &m, &d) != 3) continue;
+    struct tm etm;
+    memset(&etm, 0, sizeof(etm));
+    etm.tm_year  = y - 1900;
+    etm.tm_mon   = m - 1;
+    etm.tm_mday  = d;
+    etm.tm_hour  = ev.startHour;
+    etm.tm_min   = ev.startMin;
+    etm.tm_sec   = 0;
+    etm.tm_isdst = -1;  // let the system determine DST
+    time_t start = mktime(&etm);
+
+    // Only schedule a wake for events whose lead-time wake-up is still in the
+    // future. Events already inside the lead window were either refreshed on a
+    // prior wake or will be caught by the periodic cap.
+    if (start - (time_t)config::EVENT_WAKE_LEAD_S <= now) continue;
+    if (best == 0 || start < best) best = start;
+  }
+  return best;
+}
+
 static unsigned long calculateSleepMs() {
   time_t now = time(nullptr);
-  constexpr time_t MIN_REASONABLE_EPOCH = 1700000000; // 2023-11-14
-  if (now < MIN_REASONABLE_EPOCH) {
-    return settings::get().refresh_interval_s * 1000UL;
-  }
   const settings::Data& cfg = settings::get();
-  struct tm lt; localtime_r(&now, &lt);
-  if (isInSleepWindow(lt)) {
-    struct tm target = lt;
-    target.tm_hour = cfg.sleep_end_hour; target.tm_min = 0; target.tm_sec = 0;
-    if (lt.tm_hour >= cfg.sleep_start_hour) target.tm_mday++;  // evening -> next morning
-    time_t targetEpoch = mktime(&target);
-    long diffSec = (long)difftime(targetEpoch, now);
-    if (diffSec < 60) diffSec = 60;
-    return (unsigned long)diffSec * 1000UL;
+
+  // Clock not set (pre-NTP): can't do smart scheduling — use flat cap.
+  if (now < MIN_REASONABLE_EPOCH) {
+    return cfg.refresh_interval_s * 1000UL;
   }
-  return cfg.refresh_interval_s * 1000UL;
+
+  struct tm lt;
+  localtime_r(&now, &lt);
+
+  // Inside the nightly sleep window → sleep straight to morning.
+  if (isInSleepWindow(lt)) {
+    return sleepUntilWindowEndMs(now, lt);
+  }
+
+  // Fallback: the periodic cap guarantees we wake often enough to discover
+  // events added to MQTT while we were asleep.
+  unsigned long sleepMs = cfg.refresh_interval_s * 1000UL;
+
+  // Event-aware: wake shortly before the next upcoming event so the display
+  // is fresh when something is about to happen.
+  time_t nextEv = nextEventStartAfter(now);
+  if (nextEv > 0) {
+    long diffSec = (long)difftime(nextEv, now) - (long)config::EVENT_WAKE_LEAD_S;
+    if (diffSec < 60) diffSec = 60;  // clamp to avoid tight wake loops
+    unsigned long eventMs = (unsigned long)diffSec * 1000UL;
+    if (eventMs < sleepMs) sleepMs = eventMs;
+  }
+
+  // If the sleep window opens before our next planned wake, skip straight to
+  // morning. This avoids a wasteful wake-then-resleep at the boundary, and
+  // means events during sleep hours never wake the device.
+  if (cfg.sleep_start_hour > cfg.sleep_end_hour) {
+    unsigned long toWindowMs = msUntilWindowStart(now, lt);
+    if (toWindowMs < sleepMs) {
+      return sleepUntilWindowEndMs(now, lt);
+    }
+  }
+
+  return sleepMs;
 }
 
 static void enterSleep(const char* reason) {
@@ -165,6 +254,12 @@ static void enterSleep(const char* reason) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  setCpuFrequencyMhz(160);  // save ~30% active power vs default 240 MHz
+  // The RTC keeps UTC across deep sleep, but the C library timezone state
+  // (set by configTzTime) lives in RAM and is lost on wake. Re-apply the
+  // timezone before any localtime_r call so sleep-window checks are correct.
+  // NTP servers are passed later by connectWiFi().
+  configTzTime(config::TIMEZONE, nullptr, nullptr);
   logBootInfo();
 
   if (!display_mgr::begin()) {
@@ -172,7 +267,13 @@ void setup() {
     while (1) delay(1000);
   }
 
-  battery::sample();
+  power_mgr::WakeReason wake = power_mgr::currentWakeReason();
+
+  // Battery level changes slowly — only sample when someone might look at it
+  // (cold boot or button wake). Skip on timer wakes to save ADC power.
+  if (wake != power_mgr::WAKE_TIMER) {
+    battery::sample();
+  }
   touch_input::begin();
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
@@ -183,41 +284,67 @@ void setup() {
 
   // Trim old log files using the user-configurable retention window.
   sd_storage::cleanOldLogs((int)settings::get().history_retention_d);
-
-  power_mgr::WakeReason wake = power_mgr::currentWakeReason();
+  sd_storage::cleanOldHistory((int)settings::get().history_retention_d);
 
   // -------------------------------------------------------------------------
-  // COLD BOOT → connect WiFi, MQTT, fetch fresh data, render
+  // COLD BOOT → SD-first render, then WiFi/MQTT background refresh
   // -------------------------------------------------------------------------
   if (wake == power_mgr::WAKE_COLD_BOOT) {
-    display_mgr::drawSplash("Connecting...");
-    display_mgr::powerOn();
-    display_mgr::fullRefresh();
-    display_mgr::powerOff();
+    // --- SD-first: show cached data immediately if the RTC clock is valid ---
+    bool renderedFromCache = false;
+    if (time(nullptr) >= MIN_REASONABLE_EPOCH && networking::replaySDPayload()) {
+      syncEventsToUI();
+      needsFullRender = true;
+      doRender();
+      renderedFromCache = true;
+      Serial.println("[boot] Rendered from SD cache");
+    }
 
+    if (!renderedFromCache) {
+      // No usable cache or clock not set yet — show splash while connecting.
+      display_mgr::drawSplash("Connecting...");
+      display_mgr::powerOn();
+      display_mgr::fullRefresh();
+      display_mgr::powerOff();
+    }
+
+    // --- WiFi / NTP / MQTT refresh ---
     networking::connectWiFi();
     networking::waitForTimeSync(config::NTP_SYNC_TIMEOUT_MS);
 
+    bool gotFreshData = false;
     if (networking::isWiFiConnected()) {
       networking::connectMqtt();
-      networking::pumpForPayload(config::PAYLOAD_WAIT_MS);
+      // If we already rendered from cache, wait for NEW data specifically
+      // (pumpForFreshPayload). Otherwise, wait for any data (pumpForPayload).
+      if (renderedFromCache) {
+        gotFreshData = networking::pumpForFreshPayload(config::PAYLOAD_WAIT_MS);
+      } else {
+        gotFreshData = networking::pumpForPayload(config::PAYLOAD_WAIT_MS);
+      }
+      // Disconnect WiFi as soon as we have the payload — the render and
+      // interactive period don't need network, and WiFi is the biggest draw.
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      Serial.println("[wifi] Disconnected to save power");
     }
 
-    // If MQTT failed or no data arrived, try RTC cache
-    if (!calendarDash.hasData && networking::hasCachedPayload()) {
-      networking::replayCachedPayload();
+    // If still no data (MQTT failed), fall back to caches (no WiFi needed).
+    if (!calendarDash.hasData) {
+      if (networking::hasCachedPayload()) {
+        networking::replayCachedPayload();
+      } else {
+        networking::replaySDPayload();
+      }
     }
 
     syncEventsToUI();
 
-    // Disconnect WiFi to save power during interactive period.
-    // The retained MQTT payload is already cached; scheduled wakes
-    // will reconnect.
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    Serial.println("[wifi] Disconnected to save power");
+    // Re-render if we got fresh data, or haven't rendered yet.
+    if (gotFreshData || !renderedFromCache) {
+      needsFullRender = true;
+    }
 
-    needsFullRender = true;
     lastActivityMs = millis();
   }
 
@@ -225,6 +352,18 @@ void setup() {
   // TIMER WAKE → quick data refresh then back to sleep
   // -------------------------------------------------------------------------
   else if (wake == power_mgr::WAKE_TIMER) {
+    // If RTC says we're inside the sleep window, skip the expensive WiFi
+    // refresh and sleep straight to morning. (RTC time is valid immediately
+    // after deep sleep.)
+    time_t tnow = time(nullptr);
+    if (tnow >= MIN_REASONABLE_EPOCH) {
+      struct tm wlt; localtime_r(&tnow, &wlt);
+      if (isInSleepWindow(wlt)) {
+        Serial.println("[sleep] Timer wake inside sleep window — skipping refresh");
+        enterSleep("timer wake in sleep window");
+      }
+    }
+
     networking::connectWiFi();
     networking::waitForTimeSync(3000);
 
@@ -233,10 +372,19 @@ void setup() {
       if (networking::pumpForPayload(config::PAYLOAD_WAIT_MS)) {
         needsFullRender = true;
       }
+      // Disconnect WiFi as soon as we have the payload — the render and sleep
+      // don't need network, and WiFi is the single biggest power draw.
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      Serial.println("[wifi] Disconnected after payload");
     }
 
-    if (!calendarDash.hasData && networking::hasCachedPayload()) {
-      networking::replayCachedPayload();
+    if (!calendarDash.hasData) {
+      if (networking::hasCachedPayload()) {
+        networking::replayCachedPayload();
+      } else {
+        networking::replaySDPayload();
+      }
     }
 
     syncEventsToUI();
@@ -250,6 +398,8 @@ void setup() {
   else {
     if (networking::hasCachedPayload()) {
       networking::replayCachedPayload();
+    } else {
+      networking::replaySDPayload();
     }
     syncEventsToUI();
     needsFullRender = true;
@@ -291,21 +441,22 @@ void loop() {
   // without a fresh timestamp the unsigned subtraction can underflow.
   now = millis();
 
-  // Sleep logic: inside the configured nightly sleep window, sleep now.
-  time_t tnow = time(nullptr);
-  constexpr time_t MIN_REASONABLE_EPOCH = 1700000000;
-  if (tnow >= MIN_REASONABLE_EPOCH) {
-    struct tm lt; localtime_r(&tnow, &lt);
-    if (isInSleepWindow(lt)) {
-      enterSleep("outside active hours");
-    }
-  }
-
+  // Sleep decision: both the nightly window and the inactivity timeout are
+  // gated on inactivity, so active use (touch/button) keeps the device awake
+  // even after the window opens. The sleep *duration* (computed by
+  // calculateSleepMs via enterSleep) decides whether to sleep until morning
+  // (in window) or until the next event / periodic cap.
   unsigned long inactivityMs = settings::get().inactivity_timeout_s * 1000UL;
   if (now - lastActivityMs > inactivityMs) {
+    const char* reason = "inactivity timeout";
+    time_t tnow = time(nullptr);
+    if (tnow >= MIN_REASONABLE_EPOCH) {
+      struct tm lt; localtime_r(&tnow, &lt);
+      if (isInSleepWindow(lt)) reason = "inactivity + sleep window";
+    }
     ui::resetToDefaultView();
     doRender();
-    enterSleep("inactivity timeout");
+    enterSleep(reason);
   }
 
   if (now - lastHeartbeatMs > config::HEARTBEAT_MS) {
