@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "config.h"
 #include "dashboards/calendar_dashboard.h"
 #include "display_manager.h"
 #include "epd_driver.h"
@@ -64,6 +65,8 @@ static constexpr int DAILY_NAV_ARROW_H  = 64;   // prev/next arrow row height
 // ---------------------------------------------------------------------------
 static const CalendarEvent* s_events = nullptr;
 static int s_eventCount = 0;
+static time_t s_lastUpdated = 0;     // UTC epoch of the displayed payload's "updated" field
+static bool   s_reloadRequested = false;
 
 // ---------------------------------------------------------------------------
 // State
@@ -129,6 +132,21 @@ static void getDemoBaseDay(struct tm& out) {
   localtime_r(&now, &out);
   out.tm_hour = 12; out.tm_min = 0; out.tm_sec = 0;
   mktime(&out);
+}
+
+// Effective context-days setting, clamped to a safe range.
+static int contextDays() {
+  int cd = settings::get().context_days;
+  if (cd < 1) cd = 1;
+  if (cd > config::MAX_CONTEXT_DAYS) cd = config::MAX_CONTEXT_DAYS;
+  return cd;
+}
+// Clamp a focused-day offset (0 = today) to the navigable +/-context_days range.
+static int clampDayOffset(int offset) {
+  int cd = contextDays();
+  if (offset < -cd) offset = -cd;
+  if (offset >  cd) offset =  cd;
+  return offset;
 }
 
 // Returns true if column `colIdx` in the current view represents today.
@@ -685,17 +703,18 @@ static void drawTextWithOutline(GFXfont* font, const char* str, int x, int y,
 // ---------------------------------------------------------------------------
 // UI chrome
 // ---------------------------------------------------------------------------
-static void drawArrowButton(int x, int y, int w, int h, bool left, uint8_t* fb) {
+static void drawArrowButton(int x, int y, int w, int h, bool left, uint8_t* fb,
+                            uint8_t color = EPD_BLACK) {
 
   int cx = x + w / 2;
   int cy = y + h / 2;
   int len = h / 5;
   if (left) {
-    epd_draw_line(cx + len/2, cy - len, cx - len/2, cy, EPD_BLACK, fb);
-    epd_draw_line(cx - len/2, cy, cx + len/2, cy + len, EPD_BLACK, fb);
+    epd_draw_line(cx + len/2, cy - len, cx - len/2, cy, color, fb);
+    epd_draw_line(cx - len/2, cy, cx + len/2, cy + len, color, fb);
   } else {
-    epd_draw_line(cx - len/2, cy - len, cx + len/2, cy, EPD_BLACK, fb);
-    epd_draw_line(cx + len/2, cy, cx - len/2, cy + len, EPD_BLACK, fb);
+    epd_draw_line(cx - len/2, cy - len, cx + len/2, cy, color, fb);
+    epd_draw_line(cx + len/2, cy, cx - len/2, cy + len, color, fb);
   }
 }
 
@@ -769,7 +788,7 @@ static bool isInCooldown() {
 }
 
 static void triggerNav(int days) {
-  s_baseDayOffset += days;
+  s_baseDayOffset = clampDayOffset(s_baseDayOffset + days);
   s_selectedEventIdx = -1;
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
@@ -778,7 +797,7 @@ static void triggerNav(int days) {
 
 static void triggerScreenChange(Screen next, int dayOffset) {
   s_screen = next;
-  s_baseDayOffset = dayOffset;
+  s_baseDayOffset = clampDayOffset(dayOffset);
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
@@ -805,6 +824,7 @@ static bool hitDailyBackToWeek(int16_t x, int16_t y) {
 }
 static bool hitDailyPrev(int16_t x, int16_t y) {
   if (s_screen != SCREEN_DAILY) return false;
+  if (s_baseDayOffset <= -contextDays()) return false;  // at past edge -- < disabled
   int nx, ny, nw, nh;
   getDailyNavRect(nx, ny, nw, nh);
   int arrowTop = ny + DAILY_NAV_BACK_H;
@@ -812,6 +832,7 @@ static bool hitDailyPrev(int16_t x, int16_t y) {
 }
 static bool hitDailyNext(int16_t x, int16_t y) {
   if (s_screen != SCREEN_DAILY) return false;
+  if (s_baseDayOffset >= contextDays()) return false;  // at future edge -- > disabled
   int nx, ny, nw, nh;
   getDailyNavRect(nx, ny, nw, nh);
   int arrowTop = ny + DAILY_NAV_BACK_H;
@@ -1169,6 +1190,11 @@ static void renderWeeklyView() {
   int timelineH = weeklyCh - headerH - 8;  // 8 = 4 px top gap + 4 px bottom padding
 
   for (int i = 0; i < numCols; i++) {
+    // Boundary UX: skip the out-of-range context column entirely so the edge
+    // is visually obvious (the framebuffer was memset to white above; skipping
+    // leaves that region blank instead of rendering an empty adjacent day).
+    if (i == 0 && s_baseDayOffset <= -contextDays()) continue;  // past edge: hide left
+    if (i == 2 && s_baseDayOffset >=  contextDays()) continue;  // future edge: hide right
     struct tm day = base;
     day.tm_mday += (i - 1);  // i=0 → focus-1, i=1 → focus, i=2 → focus+1
     mktime(&day);
@@ -1496,7 +1522,7 @@ static void renderWeeklyView() {
       epd_draw_rect(blockX, blockY, blockW, renderH, EPD_BLACK, fb);
 
       FontProperties props;
-      props.fg_color = (ev.shade <= C_MDGRAY) ? C_WHITE : C_BLACK;
+      props.fg_color = C_WHITE;   // all shades: white fill + black outline for readability
       props.bg_color = ev.shade;
       props.flags = 0;
       props.fallback_glyph = 0;
@@ -1520,15 +1546,9 @@ static void renderWeeklyView() {
         // Baseline at blockY + (renderH + 10) / 2 approximately centers it
         int centerY = blockY + (renderH + 10) / 2;
 
-        if (props.fg_color == C_WHITE) {
-          drawTextWithOutline((GFXfont*)&MeltSwashes16, lineBuf,
-                              blockX + 8, centerY, fb,
-                              C_WHITE, props.bg_color);
-        } else {
-          drawTextColored((GFXfont*)&MeltSwashes16, lineBuf,
-                          blockX + 8, centerY, fb,
-                          props.fg_color, props.bg_color);
-        }
+        drawTextWithOutline((GFXfont*)&MeltSwashes16, lineBuf,
+                            blockX + 8, centerY, fb,
+                            C_WHITE, props.bg_color);
         continue;  // skip the 2-line rendering below
       }
 
@@ -1538,15 +1558,9 @@ static void renderWeeklyView() {
                       timeStr, sizeof(timeStr));
 
       // Time
-      if (props.fg_color == C_WHITE) {
-        drawTextWithOutline((GFXfont*)&MeltSwashes18, timeStr,
-                            blockX + 8, blockY + 16, fb,
-                            C_WHITE, props.bg_color);
-      } else {
-        int32_t ttcx = blockX + 8, ttcy = blockY + 16;
-        write_mode((GFXfont*)&MeltSwashes18, timeStr, &ttcx, &ttcy, fb,
-                   BLACK_ON_WHITE, &props);
-      }
+      drawTextWithOutline((GFXfont*)&MeltSwashes18, timeStr,
+                          blockX + 8, blockY + 16, fb,
+                          C_WHITE, props.bg_color);
 
       // Compute available height for text below the time line.
       // Time baseline is at blockY + 16; text below starts at blockY + 50.
@@ -1573,15 +1587,9 @@ static void renderWeeklyView() {
       for (int li = 0; li < wrapped.count; li++) {
         int lineY = blockY + TITLE_TOP_Y + li * TITLE_LINE_HEIGHT;
         if (lineY > blockY + renderH - BOTTOM_PADDING) break;  // safety
-        if (props.fg_color == C_WHITE) {
-          drawTextWithOutline((GFXfont*)&MeltSwashes16, wrapped.lines[li],
-                              blockX + 8, lineY, fb,
-                              C_WHITE, props.bg_color);
-        } else {
-          drawTextColored((GFXfont*)&MeltSwashes16, wrapped.lines[li],
-                          blockX + 8, lineY, fb,
-                          props.fg_color, props.bg_color);
-        }
+        drawTextWithOutline((GFXfont*)&MeltSwashes16, wrapped.lines[li],
+                            blockX + 8, lineY, fb,
+                            C_WHITE, props.bg_color);
       }
 
       // Optional location line below the title.
@@ -1590,14 +1598,15 @@ static void renderWeeklyView() {
         char locBuf[48];
         truncateToFitWidth((GFXfont*)&MeltSwashes14, ev.location, blockW - 16,
                            locBuf, sizeof(locBuf));
-        drawTextColored((GFXfont*)&MeltSwashes14, locBuf,
-                        blockX + 8, locY, fb,
-                        props.fg_color, props.bg_color);
+        drawTextWithOutline((GFXfont*)&MeltSwashes14, locBuf,
+                            blockX + 8, locY, fb,
+                            C_WHITE, props.bg_color);
       }
 
     }
 
   }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,14 +1648,16 @@ static void drawDailyNav(uint8_t* fb) {
     int hx = nx;
     int cxArrow = hx + nw / 4;
     int cyArrow = arrowRowY + (DAILY_NAV_ARROW_H - arrowSize) / 2;
-    drawArrowButton(cxArrow - arrowSize / 2, cyArrow, arrowSize, arrowSize, true, fb);
+    drawArrowButton(cxArrow - arrowSize / 2, cyArrow, arrowSize, arrowSize, true, fb,
+                    (s_baseDayOffset <= -contextDays()) ? EPD_LTGRAY : EPD_BLACK);
   }
   // Right half (next)
   {
     int hx = nx + nw / 2;
     int cxArrow = hx + nw / 4;
     int cyArrow = arrowRowY + (DAILY_NAV_ARROW_H - arrowSize) / 2;
-    drawArrowButton(cxArrow - arrowSize / 2, cyArrow, arrowSize, arrowSize, false, fb);
+    drawArrowButton(cxArrow - arrowSize / 2, cyArrow, arrowSize, arrowSize, false, fb,
+                    (s_baseDayOffset >= contextDays()) ? EPD_LTGRAY : EPD_BLACK);
   }
 }
 
@@ -1836,6 +1847,7 @@ static void renderDailyView() {
       displayed++;
     }
   }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1868,6 +1880,10 @@ void setEvents(const CalendarEvent* events, int count) {
   s_eventCount = count;
   s_pendingRender = true;
 }
+void setLastUpdated(time_t epoch) { s_lastUpdated = epoch; }
+time_t getLastUpdated() { return s_lastUpdated; }
+void requestEventReload() { s_reloadRequested = true; }
+bool consumeEventReloadRequest() { bool r = s_reloadRequested; s_reloadRequested = false; return r; }
 
 void toggleSettings() {
   // The button is independent of touch; reset the gesture machine so a finger

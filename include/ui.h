@@ -22,6 +22,17 @@ void resetToDefaultView();
 // until the next call (ui does not copy the data).
 void setEvents(const CalendarEvent* events, int count);
 
+// Freshness timestamp of the currently-displayed data (UTC epoch from the
+// payload's "updated" field; 0 = unknown). Set alongside setEvents().
+void setLastUpdated(time_t epoch);
+time_t getLastUpdated();   // UTC epoch of the displayed payload's "updated" field (0 = unknown)
+
+// Request that the main loop reload the cached payload. Used when a setting
+// that affects the event window (context_days) changes in the Settings modal.
+// The main loop consumes it via consumeEventReloadRequest().
+void requestEventReload();
+bool consumeEventReloadRequest();
+
 // Touch input — called every loop iteration with the current touch state.
 void updateTouch(bool isTouched, int16_t x, int16_t y);
 

@@ -6,6 +6,8 @@ namespace networking {
   void loop();              // call mqtt.loop() — keep connection alive
   void logHealth();
   bool isWiFiConnected();
+  bool isMqttConnected();
+  int  getRssi();   // WiFi RSSI in dBm, or 0 if WiFi is down
 
   // Blocks up to timeoutMs waiting for SNTP to set the system clock.
   // Returns true once time(nullptr) reflects a real epoch (either it

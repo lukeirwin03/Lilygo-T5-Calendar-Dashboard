@@ -14,6 +14,7 @@ void resetToDefaults() {
   s_data.day_start_hour = 7;
   s_data.day_end_hour = 22;
   s_data.time_format_24h = false;
+  s_data.context_days = 7;
   s_data.refresh_interval_s = 7200;
   s_data.inactivity_timeout_s = 180;
   s_data.sleep_start_hour = 22;
@@ -39,6 +40,12 @@ void init() {
       s_data.sleep_start_hour = obj["sleep_start_hour"] | s_data.sleep_start_hour;
       s_data.sleep_end_hour = obj["sleep_end_hour"] | s_data.sleep_end_hour;
       s_data.history_retention_d = obj["history_retention_d"] | s_data.history_retention_d;
+      s_data.context_days = obj["context_days"] | s_data.context_days;
+      // Schema robustness: clamp any out-of-range/legacy stored value back to
+      // the default so a bad or old settings.json can never break the window.
+      if (s_data.context_days < 1 || s_data.context_days > config::MAX_CONTEXT_DAYS) {
+        s_data.context_days = 7;
+      }
 
       Serial.println("[settings] Loaded from SD card");
     } else {
@@ -72,6 +79,7 @@ bool save() {
   obj["sleep_start_hour"] = s_data.sleep_start_hour;
   obj["sleep_end_hour"] = s_data.sleep_end_hour;
   obj["history_retention_d"] = (uint32_t)s_data.history_retention_d;
+  obj["context_days"] = s_data.context_days;
 
   String output;
   serializeJson(doc, output);

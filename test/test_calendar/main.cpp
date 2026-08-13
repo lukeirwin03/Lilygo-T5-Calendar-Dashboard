@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <cstring>
 #include <cstdio>
+#include <ctime>
 
 // ---------------------------------------------------------------------------
 // Shade hashing — djb2 variant used by CalendarDashboard::shadeForCalendar()
@@ -107,6 +108,46 @@ static void dateToString(int year, int month, int day, char* out, size_t len) {
   snprintf(out, len, "%04d-%02d-%02d", year, month, day);
 }
 
+// Mirror of CalendarDashboard::handlePayload's event-window filter.
+// Window is [todayStart - N*86400, todayStart + (N+1)*86400) — i.e. today,
+// the N days before, and the N days after (half-open so +N is inclusive).
+static bool isInWindow(int todayY, int todayMo, int todayD, int contextDays,
+                       int evY, int evMo, int evD) {
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_year = todayY - 1900; t.tm_mon = todayMo - 1; t.tm_mday = todayD;
+  t.tm_isdst = -1;
+  time_t todayStart = mktime(&t);
+  time_t windowStart = todayStart - (time_t)contextDays * 86400;
+  time_t windowEnd   = todayStart + (time_t)(contextDays + 1) * 86400;
+
+  struct tm e;
+  memset(&e, 0, sizeof(e));
+  e.tm_year = evY - 1900; e.tm_mon = evMo - 1; e.tm_mday = evD;
+  e.tm_isdst = -1;
+  time_t evDate = mktime(&e);
+
+  return evDate >= windowStart && evDate < windowEnd;
+}
+
+// Mirror of CalendarDashboard::handlePayload's past-day date computation:
+// today + offsetDays, normalized across month/year boundaries by mktime.
+// Used to read /cal/cache for past days in the bidirectional window.
+static void dateOffset(int y, int mo, int d, int offsetDays, char* out, size_t len) {
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_year = y - 1900;
+  t.tm_mon  = mo - 1;
+  t.tm_mday = d;
+  t.tm_hour = 0;
+  t.tm_min  = 0;
+  t.tm_sec  = 0;
+  t.tm_isdst = -1;
+  t.tm_mday += offsetDays;
+  mktime(&t);  // normalizes across month/year boundaries
+  strftime(out, len, "%Y-%m-%d", &t);
+}
+
 void test_date_to_string(void) {
   char buf[12];
   dateToString(2026, 7, 5, buf, sizeof(buf));
@@ -117,6 +158,72 @@ void test_date_to_string_single_digit(void) {
   char buf[12];
   dateToString(2026, 1, 1, buf, sizeof(buf));
   TEST_ASSERT_EQUAL_STRING("2026-01-01", buf);
+}
+
+// ---- Bidirectional event window (mirrors handlePayload) ----
+void test_window_today_always_included(void) {
+  // contextDays=7, today=2026-08-11
+  TEST_ASSERT_TRUE(isInWindow(2026, 8, 11, 7, 2026, 8, 11));
+}
+
+void test_window_past_edge_inclusive(void) {
+  // 7 days prior is the inclusive past edge
+  TEST_ASSERT_TRUE(isInWindow(2026, 8, 11, 7, 2026, 8, 4));
+}
+
+void test_window_past_just_outside(void) {
+  // 8 days prior is excluded
+  TEST_ASSERT_FALSE(isInWindow(2026, 8, 11, 7, 2026, 8, 3));
+}
+
+void test_window_future_edge_inclusive(void) {
+  // 7 days after is the inclusive future edge
+  TEST_ASSERT_TRUE(isInWindow(2026, 8, 11, 7, 2026, 8, 18));
+}
+
+void test_window_future_just_outside(void) {
+  // 8 days after is excluded
+  TEST_ASSERT_FALSE(isInWindow(2026, 8, 11, 7, 2026, 8, 19));
+}
+
+void test_window_n1_symmetric(void) {
+  // contextDays=1: yesterday, today, tomorrow included; day-before-yesterday and day-after-tomorrow excluded
+  TEST_ASSERT_TRUE(isInWindow(2026, 8, 11, 1, 2026, 8, 10));   // -1
+  TEST_ASSERT_TRUE(isInWindow(2026, 8, 11, 1, 2026, 8, 11));   //  0
+  TEST_ASSERT_TRUE(isInWindow(2026, 8, 11, 1, 2026, 8, 12));   // +1
+  TEST_ASSERT_FALSE(isInWindow(2026, 8, 11, 1, 2026, 8, 9));   // -2
+  TEST_ASSERT_FALSE(isInWindow(2026, 8, 11, 1, 2026, 8, 13));  // +2
+}
+
+// ---- Past-day date computation (mirrors handlePayload cache-load loop) ----
+void test_date_offset_simple_week(void) {
+  char buf[11];
+  dateOffset(2026, 8, 11, -7, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("2026-08-04", buf);
+}
+
+void test_date_offset_month_boundary_nonleap(void) {
+  char buf[11];
+  dateOffset(2026, 3, 1, -1, buf, sizeof(buf));   // day before Mar 1, 2026
+  TEST_ASSERT_EQUAL_STRING("2026-02-28", buf);    // 2026 is NOT a leap year
+}
+
+void test_date_offset_month_boundary_leap(void) {
+  char buf[11];
+  dateOffset(2024, 3, 1, -1, buf, sizeof(buf));   // day before Mar 1, 2024
+  TEST_ASSERT_EQUAL_STRING("2024-02-29", buf);    // 2024 IS a leap year
+}
+
+void test_date_offset_year_boundary(void) {
+  char buf[11];
+  dateOffset(2026, 1, 1, -1, buf, sizeof(buf));   // day before Jan 1
+  TEST_ASSERT_EQUAL_STRING("2025-12-31", buf);
+}
+
+void test_date_offset_zero_is_same_day(void) {
+  char buf[11];
+  dateOffset(2026, 8, 11, 0, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("2026-08-11", buf);
 }
 
 int main() {
@@ -138,6 +245,21 @@ int main() {
   // Date formatting
   RUN_TEST(test_date_to_string);
   RUN_TEST(test_date_to_string_single_digit);
+
+  // Bidirectional event window
+  RUN_TEST(test_window_today_always_included);
+  RUN_TEST(test_window_past_edge_inclusive);
+  RUN_TEST(test_window_past_just_outside);
+  RUN_TEST(test_window_future_edge_inclusive);
+  RUN_TEST(test_window_future_just_outside);
+  RUN_TEST(test_window_n1_symmetric);
+
+  // Past-day date math (cache load)
+  RUN_TEST(test_date_offset_simple_week);
+  RUN_TEST(test_date_offset_month_boundary_nonleap);
+  RUN_TEST(test_date_offset_month_boundary_leap);
+  RUN_TEST(test_date_offset_year_boundary);
+  RUN_TEST(test_date_offset_zero_is_same_day);
 
   UNITY_END();
   return 0;

@@ -16,3 +16,7 @@ fonts_tff/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Nested working copy of the firmware (has its own .git) — not part of this repo.
+# If you intend to track it, remove this line and add it as a proper submodule instead.
+calendar-dashboard/

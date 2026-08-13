@@ -54,16 +54,18 @@ static uint32_t payloadChecksum(const char* data, size_t len) {
 }
 
 // Persist the raw payload to SD (cache + deduped history).
-static void persistPayload(const char* payload, size_t length) {
+static bool persistPayload(const char* payload, size_t length) {
   // Don't cache payloads too large to replay from the fixed-size buffer.
-  if (length >= RTC_PAYLOAD_CAP) return;
+  if (length >= RTC_PAYLOAD_CAP) return false;
   sd_storage::savePayload(payload, length);
 
   uint32_t checksum = payloadChecksum(payload, length);
-  if (checksum != lastHistoryChecksum) {
+  bool changed = (checksum != lastHistoryChecksum);
+  if (changed) {
     lastHistoryChecksum = checksum;
     sd_storage::appendHistory(payload, length);
   }
+  return changed;
 }
 
 static void dispatchDoc(const char* topic, JsonDocument& doc) {
@@ -113,7 +115,7 @@ static void onMessage(char* topic, byte* payload, unsigned int length) {
 
   // Persist valid payload to SD card (survives power loss, enables SD-first
   // boot + deduped history). Only reached after successful JSON parse.
-  persistPayload((const char*)payload, length);
+  bool changed = persistPayload((const char*)payload, length);
 
   // Debug: show what keys we got
   Serial.printf("[mqtt] JSON keys: ");
@@ -135,6 +137,15 @@ static void onMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   dispatchDoc(topic, doc);
+
+  // Fresh/changed payload → persist the just-parsed events into the day cache
+  // so they're available as they age into the past. (No-op for dashboards
+  // without a cache.) Skipped on identical retransmits to avoid SD wear.
+  if (changed) {
+    for (size_t i = 0; i < NUM_DASHBOARDS; i++) {
+      dashboards[i]->writeCacheFromCurrent();
+    }
+  }
   Serial.println("[mqtt] === END MESSAGE ===");
 }
 
@@ -361,5 +372,7 @@ void loop() {
 }
 
 bool isWiFiConnected() { return WiFi.status() == WL_CONNECTED; }
+bool isMqttConnected() { return mqtt.connected(); }
+int  getRssi()         { return isWiFiConnected() ? (int)WiFi.RSSI() : 0; }
 
 } // namespace networking

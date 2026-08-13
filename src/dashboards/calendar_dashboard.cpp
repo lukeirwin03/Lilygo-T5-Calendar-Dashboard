@@ -1,5 +1,7 @@
 #include "dashboards/calendar_dashboard.h"
 #include "config.h"
+#include "settings.h"
+#include "sd_storage.h"
 #include <Arduino.h>
 #include <time.h>
 #include <string.h>
@@ -21,6 +23,34 @@ void CalendarDashboard::parseIsoDateTime(const char* iso, int& year, int& month,
   if (sscanf(iso, "%d-%d-%d", &year, &month, &day) < 3) return;
   const char* t = strchr(iso, 'T');
   if (t) sscanf(t + 1, "%d:%d", &hour, &min);
+}
+
+// Parse a UTC ISO-8601 timestamp ("2026-08-15T19:05:00Z") to a UTC epoch.
+// mktime() treats struct tm as LOCAL time, which would make the freshness age
+// wrong by the local TZ offset — so we briefly switch the C lib TZ to UTC,
+// convert, then restore. Single-threaded app: safe.
+static time_t parseUtcIso(const char* iso) {
+  if (!iso || !iso[0]) return 0;
+  int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+  if (sscanf(iso, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &s) < 5) return 0;
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_year = y - 1900;
+  t.tm_mon  = mo - 1;
+  t.tm_mday = d;
+  t.tm_hour = h;
+  t.tm_min  = mi;
+  t.tm_sec  = s;
+  t.tm_isdst = 0;
+  const char* cur = getenv("TZ");
+  char tzOld[32] = {0};
+  if (cur) strlcpy(tzOld, cur, sizeof(tzOld));
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  time_t epoch = mktime(&t);
+  if (cur) setenv("TZ", tzOld, 1); else unsetenv("TZ");
+  tzset();
+  return epoch;
 }
 
 int CalendarDashboard::minutesBetween(int y1,int m1,int d1,int h1,int min1,
@@ -53,8 +83,14 @@ uint8_t CalendarDashboard::shadeForCalendar(const char* name) const {
 // Data management
 // ---------------------------------------------------------------------------
 void CalendarDashboard::clearData() {
+  if (!events_) {
+#if defined(ESP32) || defined(ARDUINO_ARCH_ESP32)
+    events_ = (CalendarEvent*)ps_malloc((size_t)MAX_EVENTS * sizeof(CalendarEvent));
+#endif
+    if (!events_) events_ = (CalendarEvent*)malloc((size_t)MAX_EVENTS * sizeof(CalendarEvent));
+  }
+  if (events_) memset(events_, 0, (size_t)MAX_EVENTS * sizeof(CalendarEvent));
   eventCount_ = 0;
-  memset(events_, 0, sizeof(events_));
 }
 
 void CalendarDashboard::addEvent(const char* title, const char* location,
@@ -62,7 +98,7 @@ void CalendarDashboard::addEvent(const char* title, const char* location,
                                  const char* calendar, const char* type,
                                  const char* startIso, const char* endIso,
                                  bool allDay) {
-  if (eventCount_ >= MAX_EVENTS) {
+  if (!events_ || eventCount_ >= MAX_EVENTS) {
     static bool warned = false;
     if (!warned) {
       Serial.printf("[calendar] WARN: MAX_EVENTS (%d) cap hit — '%s' and possibly later events dropped\n",
@@ -135,24 +171,50 @@ void CalendarDashboard::dumpParsedEvents() const {
   Serial.println("[calendar] ====================");
 }
 
+void CalendarDashboard::writeCacheFromCurrent() {
+  if (!events_) return;
+  // One cache file per unique event-date present in the current window.
+  for (int i = 0; i < eventCount_; i++) {
+    const char* d = events_[i].date;
+    if (!d || !d[0]) continue;
+    bool seen = false;
+    for (int j = 0; j < i; j++) {
+      if (strcmp(events_[j].date, d) == 0) { seen = true; break; }
+    }
+    if (seen) continue;
+    sd_storage::saveDayCache(d, events_, eventCount_);
+  }
+}
+
 void CalendarDashboard::handlePayload(JsonDocument& doc) {
   clearData();
 
-  // Only load events within a forward window into memory. Events outside the
-  // window are still persisted to SD (via the caller's persistPayload) but not
-  // held in RAM — saves memory and speeds up rendering/scheduling.
+  // Freshness: capture the payload's UTC "updated" timestamp so the UI can
+  // show data age and warn when the broker has stopped publishing.
+  lastUpdated_ = 0;
+  const char* updatedStr = doc["updated"];
+  if (updatedStr && updatedStr[0]) {
+    lastUpdated_ = parseUtcIso(updatedStr);
+  }
+
   time_t now = time(nullptr);
   bool clockValid = (now >= 1700000000);
   time_t windowStart = 0;
   time_t windowEnd = 0;
+  int contextDays = settings::get().context_days;
+  if (contextDays < 1) contextDays = 1;
+  if (contextDays > config::MAX_CONTEXT_DAYS) contextDays = config::MAX_CONTEXT_DAYS;
   if (clockValid) {
     struct tm todayTm;
     localtime_r(&now, &todayTm);
     todayTm.tm_hour = 0;
     todayTm.tm_min = 0;
     todayTm.tm_sec = 0;
-    windowStart = mktime(&todayTm);
-    windowEnd = windowStart + (time_t)config::MAX_EVENT_WINDOW_DAYS * 86400;
+    time_t todayStart = mktime(&todayTm);
+    // Bidirectional window: today, the N days before, and the N days after.
+    // Half-open [start, end) so +contextDays is inclusive.
+    windowStart = todayStart - (time_t)contextDays * 86400;
+    windowEnd   = todayStart + (time_t)(contextDays + 1) * 86400;
   }
 
   int skippedCount = 0;
@@ -190,9 +252,32 @@ void CalendarDashboard::handlePayload(JsonDocument& doc) {
       addEvent(title, location, description, calendar, type, start, end, allDay);
     }
   }
+
+  // --- Augment with past days from the on-disk cache ---
+  // The broker publishes forward-only; recent past days come from /cal/cache
+  // so the bidirectional window has history to show. (Cold-start: the cache
+  // is empty until events age in — expected by design.)
+  if (clockValid && events_) {
+    for (int offset = -contextDays; offset <= -1; offset++) {
+      struct tm dayTm;
+      localtime_r(&now, &dayTm);
+      dayTm.tm_mday += offset;
+      dayTm.tm_hour = 0;
+      dayTm.tm_min = 0;
+      dayTm.tm_sec = 0;
+      mktime(&dayTm);
+      char dateStr[11];
+      strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &dayTm);
+      int loaded = sd_storage::loadDayCache(dateStr,
+                                            events_ + eventCount_,
+                                            MAX_EVENTS - eventCount_);
+      eventCount_ += loaded;
+      if (eventCount_ >= MAX_EVENTS) break;  // respect the cap
+    }
+  }
   hasData = true; dirty = true;
-  Serial.printf("[calendar] Parsed %d events (%d outside %d-day window) -> %d entries\n",
-                (int)arr.size(), skippedCount, config::MAX_EVENT_WINDOW_DAYS, eventCount_);
+  Serial.printf("[calendar] Parsed %d events (%d outside ±%d-day window) -> %d entries\n",
+                (int)arr.size(), skippedCount, contextDays, eventCount_);
 #ifdef CORE_DEBUG_LEVEL
   #if CORE_DEBUG_LEVEL >= 4
     dumpParsedEvents();

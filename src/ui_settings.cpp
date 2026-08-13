@@ -1,12 +1,15 @@
 #include "ui_settings.h"
+#include "ui.h"
 #include "settings.h"
 #include "battery.h"
+#include "networking.h"
 #include "display_manager.h"
 #include "epd_driver.h"
 #include "fonts/MeltSwashes14pt7b.h"
 #include "fonts/MeltSwashes16pt7b.h"
 #include "fonts/Genty20pt7b.h"
 #include <Arduino.h>
+#include <time.h>
 
 namespace ui_settings {
 
@@ -43,18 +46,24 @@ static constexpr uint8_t EPD_WHITE  = C_WHITE  << 4;
 // ---------------------------------------------------------------------------
 // Categories
 // ---------------------------------------------------------------------------
-enum Category { CAT_DISPLAY, CAT_POWER, CAT_COUNT };
+enum Category { CAT_DISPLAY, CAT_POWER, CAT_DIAG, CAT_COUNT };
 
 enum SettingId {
   SET_NONE,
   SET_DAY_START,
   SET_DAY_END,
   SET_TIME_FORMAT,
+  SET_CONTEXT_DAYS,
   SET_REFRESH,
   SET_INACTIVITY,
   SET_SLEEP_START,
   SET_SLEEP_END,
-  SET_RETENTION
+  SET_RETENTION,
+  SET_DIAG_UPDATED,
+  SET_DIAG_WIFI,
+  SET_DIAG_MQTT,
+  SET_DIAG_BATTERY,
+  SET_DIAG_MEMORY
 };
 
 struct RowDef {
@@ -66,6 +75,7 @@ static const RowDef displayRows[] = {
   {"Day Start",     SET_DAY_START},
   {"Day End",       SET_DAY_END},
   {"Time Format",   SET_TIME_FORMAT},
+  {"Context Days", SET_CONTEXT_DAYS},
 };
 static const RowDef powerRows[] = {
   {"Refresh Every", SET_REFRESH},
@@ -73,6 +83,13 @@ static const RowDef powerRows[] = {
   {"Sleep Starts",  SET_SLEEP_START},
   {"Sleep Ends",    SET_SLEEP_END},
   {"Keep History",  SET_RETENTION},
+};
+static const RowDef diagRows[] = {
+  {"Last Updated", SET_DIAG_UPDATED},
+  {"WiFi",         SET_DIAG_WIFI},
+  {"MQTT",         SET_DIAG_MQTT},
+  {"Battery",      SET_DIAG_BATTERY},
+  {"Memory",       SET_DIAG_MEMORY},
 };
 
 struct CategoryDef {
@@ -82,8 +99,9 @@ struct CategoryDef {
 };
 
 static const CategoryDef categories[] = {
-  {"Display", displayRows, 3},
-  {"Power",   powerRows,   5},
+  {"Display",     displayRows, 4},
+  {"Power",       powerRows,   5},
+  {"Diagnostics", diagRows,    5},
 };
 
 // ---------------------------------------------------------------------------
@@ -91,6 +109,8 @@ static const CategoryDef categories[] = {
 // ---------------------------------------------------------------------------
 static int  s_category    = CAT_DISPLAY;
 static int  s_selectedRow = 0;
+
+static bool s_contextDaysChanged = false;  // set when Context Days is cycled; consumed on modal close
 
 // Dirty tracking for partial refresh (y range within the modal).
 static int  s_dirtyY1 = 0, s_dirtyY2 = 0;
@@ -101,6 +121,7 @@ static bool s_fullRedraw = false;
 // ---------------------------------------------------------------------------
 static const int     startValues[]      = {5, 6, 7, 8, 9};
 static const int     endValues[]        = {20, 21, 22, 23};
+static const int     contextDaysValues[] = {1, 2, 3, 4, 5, 6, 7};
 static const int     sleepStartValues[] = {20, 21, 22, 23};
 static const int     sleepEndValues[]   = {5, 6, 7, 8, 9};
 static const uint32_t refreshValues[]   = {1800, 3600, 7200, 14400, 21600};
@@ -132,6 +153,9 @@ static void getValueStr(SettingId id, char* buf, size_t len) {
     case SET_DAY_START:   formatHourSetting(buf, len, s.day_start_hour, s.time_format_24h); break;
     case SET_DAY_END:     formatHourSetting(buf, len, s.day_end_hour, s.time_format_24h); break;
     case SET_TIME_FORMAT: snprintf(buf, len, "%s", s.time_format_24h ? "24 hour" : "12 hour"); break;
+    case SET_CONTEXT_DAYS:
+      snprintf(buf, len, "%d day%s", s.context_days, s.context_days == 1 ? "" : "s");
+      break;
     case SET_SLEEP_START: formatHourSetting(buf, len, s.sleep_start_hour, s.time_format_24h); break;
     case SET_SLEEP_END:   formatHourSetting(buf, len, s.sleep_end_hour, s.time_format_24h); break;
     case SET_REFRESH:
@@ -149,6 +173,42 @@ static void getValueStr(SettingId id, char* buf, size_t len) {
     case SET_RETENTION:
       if (s.history_retention_d >= 365) snprintf(buf, len, "1 year");
       else snprintf(buf, len, "%d days", s.history_retention_d);
+      break;
+    case SET_DIAG_UPDATED: {
+      time_t lu = ui::getLastUpdated();
+      if (lu == 0) { snprintf(buf, len, "no data"); break; }
+      time_t age = time(nullptr) - lu;
+      char ageStr[16];
+      if      (age < 60)   snprintf(ageStr, sizeof(ageStr), "just now");
+      else if (age < 3600) snprintf(ageStr, sizeof(ageStr), "%dm ago", (int)(age / 60));
+      else if (age < 86400)snprintf(ageStr, sizeof(ageStr), "%dh ago", (int)(age / 3600));
+      else                 snprintf(ageStr, sizeof(ageStr), "%dd ago", (int)(age / 86400));
+      struct tm lt;
+      localtime_r(&lu, &lt);
+      char ts[16];
+      strftime(ts, sizeof(ts), "%m/%d %H:%M", &lt);
+      snprintf(buf, len, "%s (%s)", ts, ageStr);
+      break;
+    }
+    case SET_DIAG_WIFI: {
+      if (networking::isWiFiConnected()) {
+        snprintf(buf, len, "On %ddBm", networking::getRssi());
+      } else {
+        snprintf(buf, len, "Off");
+      }
+      break;
+    }
+    case SET_DIAG_MQTT:
+      snprintf(buf, len, "%s", networking::isMqttConnected() ? "Connected" : "Off");
+      break;
+    case SET_DIAG_BATTERY: {
+      int p = battery::lastPercent();
+      if (p < 0) snprintf(buf, len, "--");
+      else       snprintf(buf, len, "%d%%", p);
+      break;
+    }
+    case SET_DIAG_MEMORY:
+      snprintf(buf, len, "%u KB free", (unsigned)(ESP.getFreeHeap() / 1024));
       break;
     default: snprintf(buf, len, "?");
   }
@@ -169,6 +229,13 @@ static void cycleSetting(SettingId id, int delta) {
     }
     case SET_TIME_FORMAT: {
       s.time_format_24h = !s.time_format_24h;
+      break;
+    }
+    case SET_CONTEXT_DAYS: {
+      const int n = sizeof(contextDaysValues) / sizeof(contextDaysValues[0]);
+      int i = findIndex(contextDaysValues, n, (int)s.context_days);
+      s.context_days = (uint8_t)contextDaysValues[((i + delta) % n + n) % n];
+      s_contextDaysChanged = true;  // defer the reload until the modal closes (avoids full flash per tap)
       break;
     }
     case SET_SLEEP_START: {
@@ -217,15 +284,16 @@ static void rowRect(int rowIdx, int& rx, int& ry, int& rw, int& rh) {
   rh = ROW_H - 4;
 }
 
-// Two equal tabs split across the inner width with an 8px gap.
-static void tabRects(int& tab0x, int& tab1x, int& tabY, int& tabW, int& tabH) {
+// N equal tabs split across the inner width with an 8px gap.
+static void tabRect(int index, int& x, int& y, int& w, int& h) {
   int innerX = MODAL_X + MARGIN;
   int innerW = MODAL_W - 2 * MARGIN;
-  tabW = (innerW - 8) / 2;
-  tab0x = innerX;
-  tab1x = innerX + tabW + 8;
-  tabY = MODAL_Y + TITLE_H + 4;
-  tabH = TAB_H;
+  constexpr int GAP = 8;
+  int n = CAT_COUNT;
+  w = (innerW - (n - 1) * GAP) / n;
+  x = innerX + index * (w + GAP);
+  y = MODAL_Y + TITLE_H + 4;
+  h = TAB_H;
 }
 
 static void closeBtnRect(int& cx, int& cy, int& cw, int& ch) {
@@ -312,10 +380,9 @@ static void drawSettingRow(int rowIdx, bool selected, uint8_t* fb) {
 }
 
 static void drawTabs(uint8_t* fb) {
-  int tab0x, tab1x, tabY, tabW, tabH;
-  tabRects(tab0x, tab1x, tabY, tabW, tabH);
   for (int c = 0; c < CAT_COUNT; c++) {
-    int tx = (c == 0) ? tab0x : tab1x;
+    int tx, tabY, tabW, tabH;
+    tabRect(c, tx, tabY, tabW, tabH);
     bool active = (c == s_category);
     const char* name = categories[c].name;
 
@@ -485,16 +552,19 @@ TapResult handleTap(int16_t x, int16_t y) {
     int cxb, cyb, cwb, chb;
     closeBtnRect(cxb, cyb, cwb, chb);
     if (x >= cxb && x <= cxb + cwb && y >= cyb && y <= cyb + chb) {
+      if (s_contextDaysChanged) {
+        s_contextDaysChanged = false;
+        ui::requestEventReload();   // modal closing → reload cached payload once with the new window
+      }
       return TAP_CLOSE;
     }
   }
 
   // Tabs
   {
-    int tab0x, tab1x, tabY, tabW, tabH;
-    tabRects(tab0x, tab1x, tabY, tabW, tabH);
     for (int c = 0; c < CAT_COUNT; c++) {
-      int tx = (c == 0) ? tab0x : tab1x;
+      int tx, tabY, tabW, tabH;
+      tabRect(c, tx, tabY, tabW, tabH);
       if (x >= tx && x <= tx + tabW && y >= tabY && y <= tabY + tabH) {
         if (c != s_category) {
           s_category = c;
@@ -535,6 +605,10 @@ TapResult handleTap(int16_t x, int16_t y) {
 
   // Save
   if (x >= saveX && x <= saveX + saveW && y >= btnY && y <= btnY + btnSize) {
+    if (s_contextDaysChanged) {
+      s_contextDaysChanged = false;
+      ui::requestEventReload();   // modal closing → reload cached payload once with the new window
+    }
     settings::save();
     Serial.println("[settings] Saved to SD card");
     return TAP_CLOSE;

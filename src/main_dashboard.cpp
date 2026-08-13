@@ -68,6 +68,7 @@ static void logBootInfo() {
 static void syncEventsToUI() {
   if (calendarDash.hasData) {
     ui::setEvents(calendarDash.events(), calendarDash.eventCount());
+    ui::setLastUpdated(calendarDash.lastUpdated());
   }
 }
 
@@ -285,6 +286,7 @@ void setup() {
   // Trim old log files using the user-configurable retention window.
   sd_storage::cleanOldLogs((int)settings::get().history_retention_d);
   sd_storage::cleanOldHistory((int)settings::get().history_retention_d);
+  sd_storage::cleanOldCache(config::CACHE_RETENTION_DAYS);
 
   // -------------------------------------------------------------------------
   // COLD BOOT → SD-first render, then WiFi/MQTT background refresh
@@ -417,6 +419,16 @@ void loop() {
     networking::loop();  // keep MQTT alive
   }
   handleTouch();
+
+  // If the user changed Context Days in the Settings modal, reload the cached
+  // payload so the new +/-N window takes effect immediately (no WiFi needed --
+  // re-parse whatever we already have cached).
+  if (ui::consumeEventReloadRequest()) {
+    bool ok = networking::replayCachedPayload();   // re-parse RTC-cached payload with new window
+    if (!ok) networking::replaySDPayload();         // fallback: re-parse the SD-cached payload
+    syncEventsToUI();
+    needsFullRender = true;
+  }
 
   // If new MQTT data arrived during networking::loop(), feed it to the UI
   if (calendarDash.dirty) {

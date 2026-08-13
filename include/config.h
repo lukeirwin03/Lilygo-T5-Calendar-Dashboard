@@ -25,10 +25,17 @@ namespace config {
   // Wake this many seconds before an event starts, giving the display time to
   // refresh so upcoming events appear with a comfortable lead.
   constexpr unsigned long EVENT_WAKE_LEAD_S = 600;  // 10 minutes
-  // Only load events within this many days from today into memory. Events
-  // outside this window are still persisted to SD (history) but not held in
-  // RAM. 12 days covers the visible week plus lookahead for scheduling.
-  constexpr int MAX_EVENT_WINDOW_DAYS = 12;
+  // Calendar context window. The device loads events spanning today ± N days
+  // (today, the N days before, and the N days after) into RAM and clamps
+  // day-navigation to that range. N is the user-adjustable "Context Days"
+  // setting (settings::context_days); this constant is the ceiling that must
+  // match the day-range the broker publishes.
+  constexpr int MAX_CONTEXT_DAYS = 7;
+
+  // How long to keep per-day event cache files (/cal/cache). Past events older
+  // than this are evicted (the cache exists only to fill the recent-past side
+  // of the ±context_days window; deeper history lives in /cal/history).
+  constexpr int CACHE_RETENTION_DAYS = 28;
 
   // -- Hardware pins (LilyGo T5 4.7" S3) --
   // These match the official LilyGo-EPD47 utilities.h for ESP32-S3.
