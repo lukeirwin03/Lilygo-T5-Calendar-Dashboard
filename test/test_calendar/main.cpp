@@ -5,14 +5,16 @@
 
 // ---------------------------------------------------------------------------
 // Shade hashing — djb2 variant used by CalendarDashboard::shadeForCalendar()
-// Maps calendar names to one of 4 spaced-apart grayscale shades.
+// "main" is pinned to the light shade 13; other calendar names hash across
+// the three darker shades {3, 7, 10}.
 // ---------------------------------------------------------------------------
 static uint8_t shadeForCalendar(const char* name) {
   if (!name || !name[0]) return 7;
-  unsigned long h = 5381;
+  if (strcmp(name, "main") == 0) return 13;
+  uint32_t h = 5381;
   for (const char* p = name; *p; p++) h = ((h << 5) + h) + *p;
-  const uint8_t shades[] = {3, 7, 10, 13};
-  return shades[h % 4];
+  const uint8_t shades[] = {3, 7, 10};
+  return shades[h % 3];
 }
 
 void test_shade_empty_name_returns_default(void) {
@@ -30,16 +32,19 @@ void test_shade_different_names_may_differ(void) {
   uint8_t s1 = shadeForCalendar("work");
   uint8_t s2 = shadeForCalendar("personal");
   // They might be the same by chance, but at least verify they're in the valid set
-  TEST_ASSERT_TRUE(s1 == 3 || s1 == 7 || s1 == 10 || s1 == 13);
-  TEST_ASSERT_TRUE(s2 == 3 || s2 == 7 || s2 == 10 || s2 == 13);
+  TEST_ASSERT_TRUE(s1 == 3 || s1 == 7 || s1 == 10);
+  TEST_ASSERT_TRUE(s2 == 3 || s2 == 7 || s2 == 10);
 }
 
-void test_shade_always_in_valid_range(void) {
-  const char* names[] = {"a", "b", "ab", "abc", "test", "work", "home", "main", "personal", "family"};
+void test_shade_main_is_light(void) {
+  TEST_ASSERT_EQUAL(13, shadeForCalendar("main"));
+}
+
+void test_shade_non_main_avoids_main_shade(void) {
+  const char* names[] = {"a", "b", "ab", "abc", "test", "work", "home", "personal", "family"};
   for (const char* n : names) {
     uint8_t s = shadeForCalendar(n);
-    TEST_ASSERT_TRUE(s >= 0 && s <= 15);
-    TEST_ASSERT_TRUE(s == 3 || s == 7 || s == 10 || s == 13);
+    TEST_ASSERT_TRUE(s == 3 || s == 7 || s == 10);
   }
 }
 
@@ -233,7 +238,8 @@ int main() {
   RUN_TEST(test_shade_empty_name_returns_default);
   RUN_TEST(test_shade_consistent_for_same_name);
   RUN_TEST(test_shade_different_names_may_differ);
-  RUN_TEST(test_shade_always_in_valid_range);
+  RUN_TEST(test_shade_main_is_light);
+  RUN_TEST(test_shade_non_main_avoids_main_shade);
 
   // Date parsing
   RUN_TEST(test_parse_date_only);

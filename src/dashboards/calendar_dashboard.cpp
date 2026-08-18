@@ -72,11 +72,16 @@ int CalendarDashboard::minutesBetween(int y1,int m1,int d1,int h1,int min1,
 // ---------------------------------------------------------------------------
 uint8_t CalendarDashboard::shadeForCalendar(const char* name) const {
   if (!name || !name[0]) return 7;
-  unsigned long h = 5381;
+  // The primary calendar ("main") is pinned to the reserved light shade —
+  // it reads well with plain black text and can never collide with another
+  // calendar's fill.
+  if (strcmp(name, "main") == 0) return 13;
+  uint32_t h = 5381;
   for (const char* p = name; *p; p++) h = ((h << 5) + h) + *p;
-  // Spaced-apart shades for visible contrast on e-paper (no pure black for fills)
-  const uint8_t shades[] = {3, 7, 10, 13};
-  return shades[h % 4];
+  // Spaced-apart shades for visible contrast on e-paper (no pure black for
+  // fills). 13 is reserved for "main"; other calendars cycle the darker three.
+  const uint8_t shades[] = {3, 7, 10};
+  return shades[h % 3];
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +278,12 @@ void CalendarDashboard::handlePayload(JsonDocument& doc) {
                                             MAX_EVENTS - eventCount_);
       eventCount_ += loaded;
       if (eventCount_ >= MAX_EVENTS) break;  // respect the cap
+    }
+    // Shades are a pure function of the calendar name. Re-derive them for
+    // cache-loaded events so shade-table changes apply to past days too
+    // (the on-disk cache stores the shade from when it was written).
+    for (int i = 0; i < eventCount_; i++) {
+      events_[i].shade = shadeForCalendar(events_[i].calendar);
     }
   }
   hasData = true; dirty = true;

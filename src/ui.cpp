@@ -670,16 +670,22 @@ static void drawContextList(const int* colIndices, int count,
   }
 }
 
-// Render text with a 1 px black outline around the fg_color fill. Used for
-// white text on dark fills where bare white lacks edge definition. The
-// patched font renderer skips transparent pixels, so the 8 outline passes
-// only paint where glyph pixels exist at each offset, leaving the original
-// background untouched elsewhere.
+// Render text with a solid 1 px black outline around a solid fg_color fill.
+// Used for white text on dark event-block fills where bare white lacks edge
+// definition. Both passes set fg_color == bg_color, which makes the font
+// renderer's antialiasing LUT constant (lut[c] = bg + c*(fg-bg)/15 = fg),
+// so every glyph pixel paints at full strength instead of blending toward
+// the block shade — crisp white text with a crisp black rim on any shade.
+// The patched font renderer skips transparent pixels (alpha == 0), so the
+// outline passes only paint where glyph pixels exist at each offset, leaving
+// the original background untouched elsewhere. `bg_color` is retained in the
+// signature for call-site clarity but no longer affects rendering.
 static void drawTextWithOutline(GFXfont* font, const char* str, int x, int y,
                                 uint8_t* fb, uint8_t fg_color, uint8_t bg_color) {
+  (void)bg_color;
   FontProperties outlineProps;
   outlineProps.fg_color = C_BLACK;
-  outlineProps.bg_color = bg_color;
+  outlineProps.bg_color = C_BLACK;
   outlineProps.flags = 0;
   outlineProps.fallback_glyph = 0;
 
@@ -693,11 +699,23 @@ static void drawTextWithOutline(GFXfont* font, const char* str, int x, int y,
 
   FontProperties mainProps;
   mainProps.fg_color = fg_color;
-  mainProps.bg_color = bg_color;
+  mainProps.bg_color = fg_color;
   mainProps.flags = 0;
   mainProps.fallback_glyph = 0;
   int32_t mx = x, my = y;
   write_mode(font, str, &mx, &my, fb, BLACK_ON_WHITE, &mainProps);
+}
+
+// Draw event-block text styled for its fill shade: light fills (>= C_LTGRAY)
+// read best with plain black text; darker fills use solid white text with a
+// black outline for contrast.
+static void drawBlockText(GFXfont* font, const char* str, int x, int y,
+                          uint8_t* fb, uint8_t shade) {
+  if (shade >= C_LTGRAY) {
+    drawTextColored(font, str, x, y, fb, C_BLACK, shade);
+  } else {
+    drawTextWithOutline(font, str, x, y, fb, C_WHITE, shade);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,12 +1539,6 @@ static void renderWeeklyView() {
       epd_fill_rect(blockX, blockY, blockW, renderH, ev.shade << 4, fb);
       epd_draw_rect(blockX, blockY, blockW, renderH, EPD_BLACK, fb);
 
-      FontProperties props;
-      props.fg_color = C_WHITE;   // all shades: white fill + black outline for readability
-      props.bg_color = ev.shade;
-      props.flags = 0;
-      props.fallback_glyph = 0;
-
       if (ev.durationMin <= SHORT_EVENT_THRESHOLD) {
         // ----- 1-line short-event rendering -----
         char timeStr[16];
@@ -1546,9 +1558,8 @@ static void renderWeeklyView() {
         // Baseline at blockY + (renderH + 10) / 2 approximately centers it
         int centerY = blockY + (renderH + 10) / 2;
 
-        drawTextWithOutline((GFXfont*)&MeltSwashes16, lineBuf,
-                            blockX + 8, centerY, fb,
-                            C_WHITE, props.bg_color);
+        drawBlockText((GFXfont*)&MeltSwashes16, lineBuf,
+                      blockX + 8, centerY, fb, ev.shade);
         continue;  // skip the 2-line rendering below
       }
 
@@ -1558,9 +1569,8 @@ static void renderWeeklyView() {
                       timeStr, sizeof(timeStr));
 
       // Time
-      drawTextWithOutline((GFXfont*)&MeltSwashes18, timeStr,
-                          blockX + 8, blockY + 16, fb,
-                          C_WHITE, props.bg_color);
+      drawBlockText((GFXfont*)&MeltSwashes18, timeStr,
+                    blockX + 8, blockY + 16, fb, ev.shade);
 
       // Compute available height for text below the time line.
       // Time baseline is at blockY + 16; text below starts at blockY + 50.
@@ -1587,9 +1597,8 @@ static void renderWeeklyView() {
       for (int li = 0; li < wrapped.count; li++) {
         int lineY = blockY + TITLE_TOP_Y + li * TITLE_LINE_HEIGHT;
         if (lineY > blockY + renderH - BOTTOM_PADDING) break;  // safety
-        drawTextWithOutline((GFXfont*)&MeltSwashes16, wrapped.lines[li],
-                            blockX + 8, lineY, fb,
-                            C_WHITE, props.bg_color);
+        drawBlockText((GFXfont*)&MeltSwashes16, wrapped.lines[li],
+                      blockX + 8, lineY, fb, ev.shade);
       }
 
       // Optional location line below the title.
@@ -1598,9 +1607,8 @@ static void renderWeeklyView() {
         char locBuf[48];
         truncateToFitWidth((GFXfont*)&MeltSwashes14, ev.location, blockW - 16,
                            locBuf, sizeof(locBuf));
-        drawTextWithOutline((GFXfont*)&MeltSwashes14, locBuf,
-                            blockX + 8, locY, fb,
-                            C_WHITE, props.bg_color);
+        drawBlockText((GFXfont*)&MeltSwashes14, locBuf,
+                      blockX + 8, locY, fb, ev.shade);
       }
 
     }

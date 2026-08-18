@@ -107,7 +107,7 @@ Publish a JSON object with an `events` array. The device only reads the `events`
 | `all_day` | Yes | boolean | `true` for all-day events (date-only start/end). |
 | `location` | No | string | Location text. Truncated at 47 characters. |
 | `description` | No | string | Description text. Truncated at 127 characters. |
-| `calendar` | No | string | Source calendar name. Drives the gray shade on the display (each unique name gets a consistent shade via hash). Truncated at 23 characters. |
+| `calendar` | No | string | Source calendar name. Drives the gray shade on the display (each unique name gets a consistent shade via hash; "main" is pinned to the light shade with black text, others cycle darker shades). Truncated at 23 characters. |
 | `type` | No | string | Defaults to `"event"`. Not currently used for display differentiation. |
 
 ### Time format

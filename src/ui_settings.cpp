@@ -43,6 +43,18 @@ static constexpr uint8_t EPD_DKGRAY = C_DKGRAY << 4;
 static constexpr uint8_t EPD_LTGRAY = C_LTGRAY << 4;
 static constexpr uint8_t EPD_WHITE  = C_WHITE  << 4;
 
+// The demo env excludes networking.cpp from the build (see platformio.ini).
+// The Diagnostics rows fall back to static "off" values there.
+#ifdef ENV_DEMO
+static bool demoWifiConnected() { return false; }
+static int  demoWifiRssi()      { return 0; }
+static bool demoMqttConnected() { return false; }
+#else
+static bool demoWifiConnected() { return networking::isWiFiConnected(); }
+static int  demoWifiRssi()      { return networking::getRssi(); }
+static bool demoMqttConnected() { return networking::isMqttConnected(); }
+#endif
+
 // ---------------------------------------------------------------------------
 // Categories
 // ---------------------------------------------------------------------------
@@ -191,15 +203,15 @@ static void getValueStr(SettingId id, char* buf, size_t len) {
       break;
     }
     case SET_DIAG_WIFI: {
-      if (networking::isWiFiConnected()) {
-        snprintf(buf, len, "On %ddBm", networking::getRssi());
+      if (demoWifiConnected()) {
+        snprintf(buf, len, "On %ddBm", demoWifiRssi());
       } else {
         snprintf(buf, len, "Off");
       }
       break;
     }
     case SET_DIAG_MQTT:
-      snprintf(buf, len, "%s", networking::isMqttConnected() ? "Connected" : "Off");
+      snprintf(buf, len, "%s", demoMqttConnected() ? "Connected" : "Off");
       break;
     case SET_DIAG_BATTERY: {
       int p = battery::lastPercent();
