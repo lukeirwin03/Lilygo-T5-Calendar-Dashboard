@@ -9,6 +9,7 @@ static const int sleepEndValues[]   = {5, 6, 7, 8, 9};
 static const uint32_t refreshValues[] = {1800, 3600, 7200, 14400, 21600};
 static const uint32_t inactivityValues[] = {60, 120, 180, 300, 600};
 static const uint32_t retentionValues[] = {30, 90, 180, 365};
+static const int contextDaysValues[] = {1, 2, 3, 4, 5, 6, 7};
 
 // Cycle helper (same logic as ui_settings::cycleSetting)
 template<typename T>
@@ -55,6 +56,13 @@ void test_sleep_end_cycle(void) {
   TEST_ASSERT_EQUAL(9, cycleValue(sleepEndValues, 5, 5, -1));   // wraps back
 }
 
+void test_context_days_cycle(void) {
+  TEST_ASSERT_EQUAL(2, cycleValue(contextDaysValues, 7, 1, +1));
+  TEST_ASSERT_EQUAL(1, cycleValue(contextDaysValues, 7, 7, +1));   // wraps to 1
+  TEST_ASSERT_EQUAL(7, cycleValue(contextDaysValues, 7, 1, -1));   // wraps back to 7
+  TEST_ASSERT_EQUAL(5, cycleValue(contextDaysValues, 7, 4, +1));
+}
+
 // Settings Data struct layout test
 struct Data {
   uint8_t  day_start_hour;
@@ -65,6 +73,7 @@ struct Data {
   uint8_t  sleep_start_hour;
   uint8_t  sleep_end_hour;
   uint32_t history_retention_d;
+  uint8_t  context_days;
 };
 
 void test_settings_struct_defaults(void) {
@@ -77,6 +86,7 @@ void test_settings_struct_defaults(void) {
   d.sleep_start_hour = 22;
   d.sleep_end_hour = 7;
   d.history_retention_d = 365;
+  d.context_days = 7;
 
   TEST_ASSERT_EQUAL(7, d.day_start_hour);
   TEST_ASSERT_EQUAL(22, d.day_end_hour);
@@ -86,6 +96,7 @@ void test_settings_struct_defaults(void) {
   TEST_ASSERT_EQUAL(22, d.sleep_start_hour);
   TEST_ASSERT_EQUAL(7, d.sleep_end_hour);
   TEST_ASSERT_EQUAL(365, d.history_retention_d);
+  TEST_ASSERT_EQUAL(7, d.context_days);
 }
 
 int main() {
@@ -97,6 +108,7 @@ int main() {
   RUN_TEST(test_refresh_values);
   RUN_TEST(test_inactivity_values);
   RUN_TEST(test_retention_values);
+  RUN_TEST(test_context_days_cycle);
   RUN_TEST(test_settings_struct_defaults);
 
   UNITY_END();

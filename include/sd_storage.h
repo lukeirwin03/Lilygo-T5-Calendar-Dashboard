@@ -29,4 +29,10 @@ void appendHistory(const char* payload, size_t length);
 // Delete history files older than maxDays.
 void cleanOldHistory(int maxDays);
 
+// Write the events matching `date` (from the passed array) to /cal/cache/<date>.json.
+// Caller passes the full parsed events array + each unique date; this filters internally.
+bool saveDayCache(const char* date, const CalendarEvent* events, int count);
+int  loadDayCache(const char* date, CalendarEvent* out, int maxCount);
+void cleanOldCache(int maxDays);
+
 } // namespace sd_storage

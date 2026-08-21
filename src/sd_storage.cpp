@@ -39,6 +39,7 @@ bool begin() {
 
   SD.mkdir("/cal");
   SD.mkdir("/cal/history");
+  SD.mkdir("/cal/cache");
   SD.mkdir("/config");
   SD.mkdir("/logs");
 
@@ -235,6 +236,79 @@ void appendHistory(const char* payload, size_t length) {
   f.write((const uint8_t*)payload, length);
   f.println("}");
   f.close();
+}
+
+// ---------------------------------------------------------------------------
+// Day-keyed event cache (/cal/cache/YYYY-MM-DD.json)
+// ---------------------------------------------------------------------------
+bool saveDayCache(const char* date, const CalendarEvent* events, int count) {
+  if (!mounted || !date) return false;
+  char path[40];
+  snprintf(path, sizeof(path), "/cal/cache/%s.json", date);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
+
+  JsonDocument doc;
+  JsonArray arr = doc["events"].to<JsonArray>();
+  for (int i = 0; i < count; i++) {
+    const CalendarEvent& e = events[i];
+    if (strcmp(e.date, date) != 0) continue;   // ONLY this date's events
+    JsonObject o = arr.add<JsonObject>();
+    o["title"]       = e.title;
+    o["location"]    = e.location;
+    o["description"] = e.description;
+    o["calendar"]    = e.calendar;
+    o["type"]        = e.type;
+    o["date"]        = e.date;
+    o["sh"]          = e.startHour;
+    o["sm"]          = e.startMin;
+    o["dur"]         = e.durationMin;
+    o["ad"]          = e.allDay;
+    o["shd"]         = e.shade;
+  }
+  serializeJson(doc, f);
+  f.close();
+  return true;
+}
+
+int loadDayCache(const char* date, CalendarEvent* out, int maxCount) {
+  if (!mounted || !date || !out || maxCount <= 0) return 0;
+  char path[40];
+  snprintf(path, sizeof(path), "/cal/cache/%s.json", date);
+  File f = SD.open(path, FILE_READ);
+  if (!f) return 0;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);  // parse straight from the File stream
+  f.close();
+  if (err) return 0;  // missing/corrupt/truncated -> treat as no cached data
+
+  JsonArray arr = doc["events"];
+  if (arr.isNull()) return 0;
+
+  int n = 0;
+  for (JsonObject o : arr) {
+    if (n >= maxCount) break;
+    CalendarEvent& e = out[n];
+    memset(&e, 0, sizeof(e));
+    strlcpy(e.title,       o["title"]       | "",       sizeof(e.title));
+    strlcpy(e.location,    o["location"]    | "",       sizeof(e.location));
+    strlcpy(e.description, o["description"] | "",       sizeof(e.description));
+    strlcpy(e.calendar,    o["calendar"]    | "",       sizeof(e.calendar));
+    strlcpy(e.type,        o["type"]        | "event",  sizeof(e.type));
+    strlcpy(e.date,        o["date"]        | date,     sizeof(e.date));
+    e.startHour   = o["sh"]  | 0;
+    e.startMin    = o["sm"]  | 0;
+    e.durationMin = o["dur"] | 30;
+    e.allDay      = o["ad"]  | false;
+    e.shade       = o["shd"] | 7;
+    n++;
+  }
+  return n;
+}
+
+void cleanOldCache(int maxDays) {
+  cleanOldFiles("/cal/cache", maxDays, "cache");
 }
 
 } // namespace sd_storage

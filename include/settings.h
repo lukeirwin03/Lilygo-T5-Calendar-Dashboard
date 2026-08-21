@@ -12,6 +12,7 @@ struct Data {
   uint8_t  day_start_hour;       // default 7
   uint8_t  day_end_hour;         // default 22
   bool     time_format_24h;      // default false (12-hour)
+  uint8_t  context_days;        // default 7 — days of context shown each side of today (1..MAX_CONTEXT_DAYS)
 
   // Power
   uint32_t refresh_interval_s;   // default 7200 (2 hours)

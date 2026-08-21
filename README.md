@@ -81,7 +81,7 @@ Single-day view with a tear-off calendar widget, a 3-button nav container, and a
 Tap the physical button to open the **Settings modal** (tap the button again, or tap **Close** inside the modal, to dismiss). The modal opens as a partial-refresh overlay and shows:
 
 - A **battery readout** at the top
-- A **Display** tab — Day Start, Day End, Time Format (12h/24h)
+- A **Display** tab — Day Start, Day End, Time Format (12h/24h), Context Days (days of context shown each side of today, 1–7)
 - A **Power** tab — Refresh Every, Sleep After, Sleep Starts, Sleep Ends, Keep History
 
 **Time Format (12h/24h)** toggles event times between 12-hour (`3:30 PM`) and 24-hour (`15:30`) display across the weekly and daily views.
@@ -150,7 +150,7 @@ The device is designed for battery operation — it spends most of its time in d
 - **Sampled on demand** — voltage read only on cold boot and button wake (when someone might look), not on every timer wake.
 
 ### Memory
-- **Event window** — only events within the next 12 days are loaded into memory. Events outside the window are still persisted to the SD card history but not held in RAM.
+- **Event window** — events within today ± the **Context Days** setting (default 7, adjustable 1–7 in the Settings modal) are loaded into memory. Events outside the window are still persisted to the SD card history but not held in RAM. Day-navigation is clamped to this range; the weekly context column is hidden and the daily arrow is grayed at the edges to signal the boundary.
 
 ### Future opportunities
 - **Light sleep during interaction** — replace the touch-poll loop with GPIO-interrupt wake from light sleep (~1–5 mA vs ~80 mA active). Biggest remaining win for battery life.
@@ -174,6 +174,9 @@ publisher (cron/script/integration)
 **Topic:** `dashboard/calendar`
 
 The MQTT buffer is 4 KB. The publisher **must** set `retain=true`.
+A discreet freshness indicator at the top of the screen shows the payload's data age and flags staleness (in a darker shade, prefixed with `!`) when the broker hasn't published within twice the Refresh Every interval.
+
+See [`docs/mqtt-setup.md`](docs/mqtt-setup.md) for the full broker contract — payload format, field limits, retain behavior, and `mosquitto_pub`/`mosquitto_sub` testing commands.
 
 ### Payload schema
 

@@ -25,15 +25,18 @@ public:
   const char* name() const override;
   void handlePayload(JsonDocument& doc) override;
   void render() override;
+  void writeCacheFromCurrent() override;
 
   // Expose parsed events for external rendering (ui)
   const CalendarEvent* events() const { return events_; }
   int eventCount() const { return eventCount_; }
+  time_t lastUpdated() const { return lastUpdated_; }
 
 private:
-  static constexpr int MAX_EVENTS = 64;
-  CalendarEvent events_[MAX_EVENTS];
+  static constexpr int MAX_EVENTS = 256;
+  CalendarEvent* events_ = nullptr;   // lazily allocated in clearData() (PSRAM w/ internal-RAM fallback)
   int eventCount_ = 0;
+  time_t lastUpdated_ = 0;   // UTC epoch parsed from the payload's "updated" field (0 = unknown)
 
   void clearData();
   void addEvent(const char* title, const char* location, const char* description,
