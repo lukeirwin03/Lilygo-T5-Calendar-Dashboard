@@ -67,6 +67,7 @@ static const CalendarEvent* s_events = nullptr;
 static int s_eventCount = 0;
 static time_t s_lastUpdated = 0;     // UTC epoch of the displayed payload's "updated" field
 static bool   s_reloadRequested = false;
+static bool   s_manualRefreshRequested = false;
 
 // ---------------------------------------------------------------------------
 // State
@@ -277,20 +278,30 @@ static void formatTimeRange(int startHour, int startMin, int durationMin,
 }
 
 // Compute the block height for a timed event given its duration.
-// - Short events (<= SHORT_EVENT_THRESHOLD): 1-line format, proportional
-//   in the SHORT_EVENT_MIN_H..SHORT_EVENT_MAX_H range (clamped to 30 min floor).
+// - Short events (<= SHORT_EVENT_THRESHOLD): 1-line format, larger of the
+//   SHORT_EVENT_MIN_H..SHORT_EVENT_MAX_H readability ramp (clamped to 30 min
+//   floor) and the proportional slot height. The ramp guarantees the single
+//   text line fits on sparse timelines; the proportional value makes
+//   back-to-back events fill their time slots on dense timelines so they
+//   remain visually contiguous.
 // - Longer events: 2-line format, larger of MIN_BLOCK_HEIGHT and proportional, with
 //   the proportional value capped at LONG_EVENT_CAP_MIN (8 hr) so very long events
 //   plateau rather than dominating the column.
 static int computeBlockHeight(int durationMin, int timelineH, int dayMinutes, int minH) {
+  int proportional = (durationMin * timelineH) / dayMinutes;
   if (durationMin <= SHORT_EVENT_THRESHOLD) {
+    // 1-line format: the 28-50 px ramp guarantees the single text line fits.
+    // On dense timelines the proportional slot is larger -- take the max so
+    // back-to-back events remain visually contiguous (their blocks fill the
+    // time slot, leaving only the deliberate EVENT_GAP between them).
     int clamped = max(30, durationMin);
-    return SHORT_EVENT_MIN_H
-           + (clamped - 30) * (SHORT_EVENT_MAX_H - SHORT_EVENT_MIN_H) / 30;
+    int ramp = SHORT_EVENT_MIN_H
+               + (clamped - 30) * (SHORT_EVENT_MAX_H - SHORT_EVENT_MIN_H) / 30;
+    return max(ramp, proportional);
   }
   int cappedDur = min(durationMin, LONG_EVENT_CAP_MIN);
-  int proportional = (cappedDur * timelineH) / dayMinutes;
-  return max(minH, proportional);
+  int cappedProportional = (cappedDur * timelineH) / dayMinutes;
+  return max(minH, cappedProportional);
 }
 
 // Collect event indices for a date, logging when the per-day cap is hit.
@@ -1613,6 +1624,28 @@ static void renderWeeklyView() {
 
     }
 
+    // "Now" line — horizontal marker at the current time on today's focus
+    // column. Skipped when the clock isn't set (pre-NTP/demo), when the
+    // focus day isn't today, or when now is outside the drawn range.
+    {
+      time_t nowT = time(nullptr);
+      if (nowT >= 1700000000 && s_baseDayOffset == 0) {  // 1700000000 = earliest plausible epoch (clock-set check)
+        struct tm nowTm;
+        localtime_r(&nowT, &nowTm);
+        int nowMin = nowTm.tm_hour * 60 + nowTm.tm_min;
+        if (nowMin >= focusRangeStart && nowMin < focusRangeEnd) {
+          int nowY = focusTimelineTop
+                     + ((nowMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+          // Black line with 1px white halo above/below: reads cleanly on the
+          // white background AND on dark shaded event blocks (the halo creates
+          // separation). Inset matches the existing grid/boundary line convention.
+          epd_draw_hline(x + 8, nowY - 1, colW - 16, EPD_WHITE, fb);
+          epd_draw_hline(x + 8, nowY,     colW - 16, EPD_BLACK, fb);
+          epd_draw_hline(x + 8, nowY + 1, colW - 16, EPD_WHITE, fb);
+        }
+      }
+    }
+
   }
 
 }
@@ -1713,7 +1746,17 @@ static void renderDailyView() {
   epd_fill_rect(cx, statusY, cw, DAILY_STATUS_H, EPD_LTGRAY, fb);
   epd_draw_rect(cx, statusY, cw, DAILY_STATUS_H, EPD_BLACK, fb);
   char statusBuf[48];
-  snprintf(statusBuf, sizeof(statusBuf), "Events: %d | All-day: %d", timedCount, allDayCount);
+  char nowStr[16] = "";
+  time_t nowT = time(nullptr);
+  if (nowT >= 1700000000 && s_baseDayOffset == 0) {  // clock set + viewing today
+    struct tm nowTm;
+    localtime_r(&nowT, &nowTm);
+    formatTime(nowTm.tm_hour, nowTm.tm_min, nowStr, sizeof(nowStr));
+  }
+  if (nowStr[0]) snprintf(statusBuf, sizeof(statusBuf), "Events: %d | All-day: %d | Now %s",
+                          timedCount, allDayCount, nowStr);
+  else           snprintf(statusBuf, sizeof(statusBuf), "Events: %d | All-day: %d",
+                          timedCount, allDayCount);
   {
     FontProperties sp;
     sp.fg_color = C_BLACK; sp.bg_color = C_LTGRAY; sp.flags = 0; sp.fallback_glyph = 0;
@@ -1892,6 +1935,8 @@ void setLastUpdated(time_t epoch) { s_lastUpdated = epoch; }
 time_t getLastUpdated() { return s_lastUpdated; }
 void requestEventReload() { s_reloadRequested = true; }
 bool consumeEventReloadRequest() { bool r = s_reloadRequested; s_reloadRequested = false; return r; }
+void requestManualRefresh() { s_manualRefreshRequested = true; }
+bool consumeManualRefreshRequest() { bool r = s_manualRefreshRequested; s_manualRefreshRequested = false; return r; }
 
 void toggleSettings() {
   // The button is independent of touch; reset the gesture machine so a finger
