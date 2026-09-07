@@ -53,6 +53,18 @@ static time_t parseUtcIso(const char* iso) {
   return epoch;
 }
 
+// Two events are considered the same occurrence if date, title, start time,
+// all-day flag and calendar name match. Used to dedup the SD day-cache merge
+// against events already contributed by the live payload.
+static bool sameOccurrence(const CalendarEvent& a, const CalendarEvent& b) {
+  return a.allDay == b.allDay
+      && a.startHour == b.startHour
+      && a.startMin == b.startMin
+      && strcmp(a.date, b.date) == 0
+      && strcmp(a.title, b.title) == 0
+      && strcmp(a.calendar, b.calendar) == 0;
+}
+
 int CalendarDashboard::minutesBetween(int y1,int m1,int d1,int h1,int min1,
                                       int y2,int m2,int d2,int h2,int min2) {
   struct tm t1 = {0};
@@ -259,10 +271,14 @@ void CalendarDashboard::handlePayload(JsonDocument& doc) {
   }
 
   // --- Augment with past days from the on-disk cache ---
-  // The broker publishes forward-only; recent past days come from /cal/cache
-  // so the bidirectional window has history to show. (Cold-start: the cache
-  // is empty until events age in — expected by design.)
+  // The publisher sends past events too (docs recommend now−9d…now+9d), so
+  // past days are often already populated from the payload. The merge below
+  // dedups each cached day against the events already in events_ — without
+  // that, occurrences present in both the payload and the cache would exist
+  // twice and every cache rewrite would compound the copies.
+  // (Cold-start: the cache is empty until events age in — expected by design.)
   if (clockValid && events_) {
+    int skippedDupes = 0;
     for (int offset = -contextDays; offset <= -1; offset++) {
       struct tm dayTm;
       localtime_r(&now, &dayTm);
@@ -273,11 +289,32 @@ void CalendarDashboard::handlePayload(JsonDocument& doc) {
       mktime(&dayTm);
       char dateStr[11];
       strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &dayTm);
+      // Load the day's cached events into the tail of events_ ...
+      int base = eventCount_;  // loaded block starts here
       int loaded = sd_storage::loadDayCache(dateStr,
-                                            events_ + eventCount_,
-                                            MAX_EVENTS - eventCount_);
-      eventCount_ += loaded;
+                                            events_ + base,
+                                            MAX_EVENTS - base);
+      // ... then compact in place: keep only cached events that don't
+      // duplicate an event already present (payload events plus cached
+      // events kept so far).
+      int kept = 0;
+      for (int i = 0; i < loaded; i++) {
+        bool dupe = false;
+        for (int j = 0; j < base + kept; j++) {
+          if (sameOccurrence(events_[base + i], events_[j])) { dupe = true; break; }
+        }
+        if (dupe) {
+          skippedDupes++;
+        } else {
+          events_[base + kept] = events_[base + i];  // may overlap (kept <= i); assignment handles it
+          kept++;
+        }
+      }
+      eventCount_ += kept;
       if (eventCount_ >= MAX_EVENTS) break;  // respect the cap
+    }
+    if (skippedDupes > 0) {
+      Serial.printf("[calendar] Skipped %d duplicate cached events\n", skippedDupes);
     }
     // Shades are a pure function of the calendar name. Re-derive them for
     // cache-loaded events so shade-table changes apply to past days too

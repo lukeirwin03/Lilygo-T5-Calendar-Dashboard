@@ -231,6 +231,224 @@ void test_date_offset_zero_is_same_day(void) {
   TEST_ASSERT_EQUAL_STRING("2026-08-11", buf);
 }
 
+// ---------------------------------------------------------------------------
+// Cache-merge dedup — mirrors CalendarDashboard::handlePayload's SD day-cache
+// augmentation. The publisher sends past events too (docs recommend
+// now−9d…now+9d), so cached past days must be deduped against events already
+// contributed by the live payload (and against each other).
+// ---------------------------------------------------------------------------
+// Mirror of the firmware's CalendarEvent, limited to the fields the dedup
+// logic touches. (The real header pulls in ArduinoJson via dashboard.h and
+// can't be compiled in the native test env.)
+struct CalendarEvent {
+  char title[64];
+  char calendar[24];   // source calendar name (matches firmware field width)
+  char date[11];       // YYYY-MM-DD
+  int  startHour;
+  int  startMin;
+  int  durationMin;
+  bool allDay;
+};
+
+// Mirror of the file-scope sameOccurrence() helper in calendar_dashboard.cpp.
+// Two events are the same occurrence if date, title, start time, all-day
+// flag and calendar name match.
+static bool sameOccurrence(const CalendarEvent& a, const CalendarEvent& b) {
+  return a.allDay == b.allDay
+      && a.startHour == b.startHour
+      && a.startMin == b.startMin
+      && strcmp(a.date, b.date) == 0
+      && strcmp(a.title, b.title) == 0
+      && strcmp(a.calendar, b.calendar) == 0;
+}
+
+// Mirror of handlePayload's per-day merge: payload events live at
+// events[0..payloadCount-1]; append cached[] events that don't duplicate an
+// event already merged (payload events plus cached events kept so far).
+// Returns the new total count, capped at maxEvents.
+static int mergeCachedEvents(CalendarEvent* events, int payloadCount,
+                             const CalendarEvent* cached, int cachedCount,
+                             int maxEvents) {
+  int kept = 0;
+  int room = maxEvents - payloadCount;
+  for (int i = 0; i < cachedCount && kept < room; i++) {
+    events[payloadCount + kept] = cached[i];  // stage candidate at the tail
+    bool dupe = false;
+    for (int j = 0; j < payloadCount + kept; j++) {
+      if (sameOccurrence(events[payloadCount + kept], events[j])) { dupe = true; break; }
+    }
+    if (!dupe) kept++;
+  }
+  return payloadCount + kept;
+}
+
+static CalendarEvent makeEvent(const char* title, const char* date,
+                               int hour, int min, bool allDay,
+                               int durationMin = 60,
+                               const char* calendar = "main") {
+  CalendarEvent e = {};
+  snprintf(e.title, sizeof(e.title), "%s", title);
+  snprintf(e.calendar, sizeof(e.calendar), "%s", calendar);
+  snprintf(e.date, sizeof(e.date), "%s", date);
+  e.startHour = hour;
+  e.startMin = min;
+  e.durationMin = durationMin;
+  e.allDay = allDay;
+  return e;
+}
+
+void test_merge_identical_cached_event_skipped(void) {
+  CalendarEvent events[4];
+  events[0] = makeEvent("Standup", "2026-08-20", 9, 0, false, 30);
+  CalendarEvent cached[1] = { makeEvent("Standup", "2026-08-20", 9, 0, false, 30) };
+  int total = mergeCachedEvents(events, 1, cached, 1, 4);
+  TEST_ASSERT_EQUAL(1, total);  // duplicate dropped, count stays at payloadCount
+  TEST_ASSERT_EQUAL_STRING("Standup", events[0].title);
+}
+
+void test_merge_same_title_time_different_date_kept(void) {
+  CalendarEvent events[4];
+  events[0] = makeEvent("Standup", "2026-08-20", 9, 0, false);
+  CalendarEvent cached[1] = { makeEvent("Standup", "2026-08-19", 9, 0, false) };
+  int total = mergeCachedEvents(events, 1, cached, 1, 4);
+  TEST_ASSERT_EQUAL(2, total);
+  TEST_ASSERT_EQUAL_STRING("2026-08-19", events[1].date);
+}
+
+void test_merge_same_date_title_different_time_kept(void) {
+  CalendarEvent events[4];
+  events[0] = makeEvent("Standup", "2026-08-20", 9, 0, false);
+  CalendarEvent cached[1] = { makeEvent("Standup", "2026-08-20", 10, 30, false) };
+  int total = mergeCachedEvents(events, 1, cached, 1, 4);
+  TEST_ASSERT_EQUAL(2, total);
+  TEST_ASSERT_EQUAL(10, events[1].startHour);
+  TEST_ASSERT_EQUAL(30, events[1].startMin);
+}
+
+void test_merge_duplicate_within_cache_collapsed(void) {
+  CalendarEvent events[4];
+  events[0] = makeEvent("Payload event", "2026-08-20", 8, 0, false);
+  CalendarEvent cached[2] = {
+    makeEvent("Cached event", "2026-08-19", 14, 0, false),
+    makeEvent("Cached event", "2026-08-19", 14, 0, false),  // same occurrence again
+  };
+  int total = mergeCachedEvents(events, 1, cached, 2, 4);
+  TEST_ASSERT_EQUAL(2, total);  // collapsed to a single copy
+  TEST_ASSERT_EQUAL_STRING("Cached event", events[1].title);
+}
+
+void test_merge_respects_max_events(void) {
+  CalendarEvent events[4];
+  events[0] = makeEvent("Payload A", "2026-08-20", 8, 0, false);
+  events[1] = makeEvent("Payload B", "2026-08-21", 9, 0, false);
+  CalendarEvent cached[3] = {
+    makeEvent("Cached A", "2026-08-19", 10, 0, false),
+    makeEvent("Cached B", "2026-08-18", 11, 0, false),
+    makeEvent("Cached C", "2026-08-17", 12, 0, false),
+  };
+  int total = mergeCachedEvents(events, 2, cached, 3, 4);
+  TEST_ASSERT_EQUAL(4, total);  // 2 payload + only 2 of 3 cached fit
+  TEST_ASSERT_EQUAL_STRING("Cached A", events[2].title);
+  TEST_ASSERT_EQUAL_STRING("Cached B", events[3].title);
+}
+
+void test_merge_same_occurrence_different_calendar_kept(void) {
+  // All-day "Holiday" from two different calendars is NOT a duplicate —
+  // the calendar name is part of the identity.
+  CalendarEvent events[4];
+  events[0] = makeEvent("Holiday", "2026-08-20", 0, 0, true, 0, "personal");
+  CalendarEvent cached[1] = { makeEvent("Holiday", "2026-08-20", 0, 0, true, 0, "work") };
+  int total = mergeCachedEvents(events, 1, cached, 1, 4);
+  TEST_ASSERT_EQUAL(2, total);  // different calendar -> kept, count increments
+  TEST_ASSERT_EQUAL_STRING("work", events[1].calendar);
+}
+
+void test_merge_payload_copy_wins(void) {
+  CalendarEvent events[4];
+  events[0] = makeEvent("Standup", "2026-08-20", 9, 0, false, 30);  // payload copy
+  CalendarEvent cached[1] = { makeEvent("Standup", "2026-08-20", 9, 0, false, 999) };  // stale cached copy
+  int total = mergeCachedEvents(events, 1, cached, 1, 4);
+  TEST_ASSERT_EQUAL(1, total);
+  TEST_ASSERT_EQUAL(30, events[0].durationMin);  // payload's copy survived
+}
+
+// ---------------------------------------------------------------------------
+// Weekly-view focus-column block geometry — mirrors computeBlockHeight() and
+// the blockY computation in src/ui.cpp. Short events take the max of the
+// 28-50 px text ramp and the proportional time slot so back-to-back events
+// fill their slots on dense timelines (only the deliberate EVENT_GAP remains);
+// long events take the max of minH and the LONG_EVENT_CAP_MIN-capped
+// proportional height.
+// ---------------------------------------------------------------------------
+static const int EVENT_GAP            = 4;    // px gap rendered between blocks
+static const int SHORT_EVENT_THRESHOLD = 60;  // min; events <= this use 1-line format
+static const int SHORT_EVENT_MIN_H     = 28;  // px; 1-line block min height
+static const int SHORT_EVENT_MAX_H     = 50;  // px; 1-line block max height (at 60 min)
+static const int LONG_EVENT_CAP_MIN    = 480; // min; longer events plateau
+
+static int imax(int a, int b) { return (a > b) ? a : b; }
+static int imin(int a, int b) { return (a < b) ? a : b; }
+
+static int computeBlockHeight(int durationMin, int timelineH, int dayMinutes, int minH) {
+  int proportional = (durationMin * timelineH) / dayMinutes;
+  if (durationMin <= SHORT_EVENT_THRESHOLD) {
+    int clamped = imax(30, durationMin);
+    int ramp = SHORT_EVENT_MIN_H
+               + (clamped - 30) * (SHORT_EVENT_MAX_H - SHORT_EVENT_MIN_H) / 30;
+    return imax(ramp, proportional);
+  }
+  int cappedDur = imin(durationMin, LONG_EVENT_CAP_MIN);
+  int cappedProportional = (cappedDur * timelineH) / dayMinutes;
+  return imax(minH, cappedProportional);
+}
+
+// Mirror of the weekly-view focus-column positioning:
+// top + ((visStart - rangeStart) * timelineH) / rangeMinutes
+static int blockY(int top, int visStart, int rangeStart, int timelineH, int rangeMinutes) {
+  return top + ((visStart - rangeStart) * timelineH) / rangeMinutes;
+}
+
+void test_blockheight_dense_backtoback_fills_slot(void) {
+  // The bug scenario: 6 h focus range, three back-to-back 60-min events
+  // (1-2, 2-3, 3-4 PM). Each block must fill its ~56 px proportional slot.
+  const int timelineH = 338, dayMinutes = 360;
+  const int rangeStart = 720;                 // noon
+  const int starts[3] = {780, 840, 900};
+  const int slotH = (60 * timelineH) / dayMinutes;  // 56
+  int y[3], h[3];
+  for (int i = 0; i < 3; i++) {
+    h[i] = computeBlockHeight(60, timelineH, dayMinutes, 40);
+    TEST_ASSERT_EQUAL(slotH, h[i]);
+    y[i] = blockY(0, starts[i], rangeStart, timelineH, dayMinutes);
+  }
+  for (int i = 0; i + 1 < 3; i++) {
+    // Consecutive blocks leave only the deliberate EVENT_GAP of white space
+    // (plus at most 1 px of integer-truncation drift in the independent
+    // blockY computations — floor(a+b) >= floor(a)+floor(b) guarantees the
+    // gap never falls below EVENT_GAP, so blocks never visually overlap).
+    int gap = y[i + 1] - (y[i] + h[i] - EVENT_GAP);
+    TEST_ASSERT_TRUE(gap == EVENT_GAP || gap == EVENT_GAP + 1);
+  }
+}
+
+void test_blockheight_sparse_keeps_text_floor(void) {
+  // 18 h focus range: proportional slots (~18 px) fall below the text ramp,
+  // so the 28-50 px readability floor applies.
+  const int timelineH = 338, dayMinutes = 1080;
+  TEST_ASSERT_EQUAL(50, computeBlockHeight(60, timelineH, dayMinutes, 40));  // ramp, not ~18
+  TEST_ASSERT_EQUAL(28, computeBlockHeight(30, timelineH, dayMinutes, 40));  // ramp floor
+}
+
+void test_blockheight_long_uses_min_and_proportional(void) {
+  TEST_ASSERT_EQUAL(84, computeBlockHeight(90, 338, 360, 63));    // (90*338)/360 beats minH
+  TEST_ASSERT_EQUAL(40, computeBlockHeight(90, 338, 1080, 40));   // proportional 28 < minH 40
+}
+
+void test_blockheight_long_cap_plateau(void) {
+  // 600 min capped at LONG_EVENT_CAP_MIN (480): (480*338)/1440 = 112, not 140.
+  TEST_ASSERT_EQUAL(112, computeBlockHeight(600, 338, 1440, 40));
+}
+
 int main() {
   UNITY_BEGIN();
 
@@ -266,6 +484,21 @@ int main() {
   RUN_TEST(test_date_offset_month_boundary_leap);
   RUN_TEST(test_date_offset_year_boundary);
   RUN_TEST(test_date_offset_zero_is_same_day);
+
+  // Cache-merge dedup (day-cache augmentation)
+  RUN_TEST(test_merge_identical_cached_event_skipped);
+  RUN_TEST(test_merge_same_title_time_different_date_kept);
+  RUN_TEST(test_merge_same_date_title_different_time_kept);
+  RUN_TEST(test_merge_duplicate_within_cache_collapsed);
+  RUN_TEST(test_merge_respects_max_events);
+  RUN_TEST(test_merge_same_occurrence_different_calendar_kept);
+  RUN_TEST(test_merge_payload_copy_wins);
+
+  // Weekly-view block geometry (dense/sparse timelines, long-event caps)
+  RUN_TEST(test_blockheight_dense_backtoback_fills_slot);
+  RUN_TEST(test_blockheight_sparse_keeps_text_floor);
+  RUN_TEST(test_blockheight_long_uses_min_and_proportional);
+  RUN_TEST(test_blockheight_long_cap_plateau);
 
   UNITY_END();
   return 0;
