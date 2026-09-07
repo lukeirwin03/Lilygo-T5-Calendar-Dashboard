@@ -81,8 +81,8 @@ void test_settings_struct_defaults(void) {
   d.day_start_hour = 7;
   d.day_end_hour = 22;
   d.time_format_24h = false;
-  d.refresh_interval_s = 7200;
-  d.inactivity_timeout_s = 180;
+  d.refresh_interval_s = 3600;
+  d.inactivity_timeout_s = 60;
   d.sleep_start_hour = 22;
   d.sleep_end_hour = 7;
   d.history_retention_d = 365;
@@ -91,8 +91,8 @@ void test_settings_struct_defaults(void) {
   TEST_ASSERT_EQUAL(7, d.day_start_hour);
   TEST_ASSERT_EQUAL(22, d.day_end_hour);
   TEST_ASSERT_EQUAL(false, d.time_format_24h);
-  TEST_ASSERT_EQUAL(7200, d.refresh_interval_s);
-  TEST_ASSERT_EQUAL(180, d.inactivity_timeout_s);
+  TEST_ASSERT_EQUAL(3600, d.refresh_interval_s);
+  TEST_ASSERT_EQUAL(60, d.inactivity_timeout_s);
   TEST_ASSERT_EQUAL(22, d.sleep_start_hour);
   TEST_ASSERT_EQUAL(7, d.sleep_end_hour);
   TEST_ASSERT_EQUAL(365, d.history_retention_d);

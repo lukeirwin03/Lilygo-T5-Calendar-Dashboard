@@ -33,6 +33,12 @@ time_t getLastUpdated();   // UTC epoch of the displayed payload's "updated" fie
 void requestEventReload();
 bool consumeEventReloadRequest();
 
+// Request that the main loop force a fresh MQTT pull. Set by the Settings
+// modal's "Sync" button; consumed by the main loop via
+// consumeManualRefreshRequest().
+void requestManualRefresh();
+bool consumeManualRefreshRequest();
+
 // Touch input — called every loop iteration with the current touch state.
 void updateTouch(bool isTouched, int16_t x, int16_t y);
 

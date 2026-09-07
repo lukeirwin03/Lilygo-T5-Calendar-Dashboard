@@ -83,10 +83,11 @@ Tap the physical button to open the **Settings modal** (tap the button again, or
 - A **battery readout** at the top
 - A **Display** tab — Day Start, Day End, Time Format (12h/24h), Context Days (days of context shown each side of today, 1–7)
 - A **Power** tab — Refresh Every, Sleep After, Sleep Starts, Sleep Ends, Keep History
+- A **Sync** button next to **Save** — forces a fresh MQTT pull (the modal closes; the display re-renders when fresh data lands, ~10–30 s later) (dashboard env only — the demo build has no networking)
 
 **Time Format (12h/24h)** toggles event times between 12-hour (`3:30 PM`) and 24-hour (`15:30`) display across the weekly and daily views.
 
-**Sleep After** is the inactivity timeout (default 3 minutes): once the device has been idle for that long it resets the display to the weekly-today view, renders it, and goes to deep sleep. This timeout also gates the nightly window — active use keeps the device awake even after the window opens.
+**Sleep After** is the inactivity timeout (default 1 minute): once the device has been idle for that long it resets the display to the weekly-today view, renders it, and goes to deep sleep. This timeout also gates the nightly window — active use keeps the device awake even after the window opens.
 
 **Sleep Starts / Sleep Ends** define the nightly deep-sleep window (default 10 PM – 7 AM). During this window the device sleeps straight through until the end hour — timer wakes that land inside the window skip the WiFi refresh entirely and go back to sleep. Events that fall inside the window do **not** trigger a wake. This scheduled window applies to the **dashboard** env only — the **demo** env has no RTC/NTP clock, so it ignores it and still sleeps on the **Sleep After** inactivity timeout.
 
@@ -97,22 +98,21 @@ Changes are persisted to `/config/settings.json` on the SD card when a card is p
 The device spends almost all its time in deep sleep (~10–150 µA) and wakes on three triggers:
 
 1. **Cold boot** — load cached payload from SD and render immediately (if the RTC clock is valid), then connect WiFi/MQTT in the background and re-render if the broker delivers a fresh payload
-2. **Timer wake** — refresh WiFi/MQTT, render latest data, go back to sleep
-3. **Button wake** — replay cached payload, stay awake for interaction, sleep after inactivity
+2. **Timer wake** — refresh WiFi/MQTT, render latest data, stay touch-responsive for at least 15 s, go back to sleep
+3. **Button/touch wake** — show the cached payload instantly, then connect and pull the latest retained message in the background (fresh data re-renders ~10–30 s later); sleep after inactivity
 
 ### How long it sleeps (dashboard env)
 
 Sleep duration is chosen to be as short as needed but no shorter, picking the earliest of:
 
-- **Event-aware wake** — the device wakes 10 minutes before the next upcoming event starts, so the display is fresh when something is about to happen. All-day events are ignored (no meaningful start moment).
-- **Periodic fallback** — if no event is imminent, the device wakes at most every **Refresh Every** interval (default 2 hours). This is the freshness guarantee: any event added to the MQTT source while the device sleeps is discovered within one fallback window.
+- **Periodic wake** — the device wakes at the **Refresh Every** interval (default 1 hour), aligned to the top of the hour — just past :00, or on the interval boundary for sub-hour settings. This is the freshness guarantee: any event added to the MQTT source while the device sleeps is discovered within one interval.
 - **Sleep window** — during the nightly window (default 10 PM – 7 AM) the device skips all of the above and sleeps straight through to morning. Timer wakes that land inside the window detect it from the RTC and go back to sleep without turning on WiFi. Events during the window do not trigger a wake.
 
 If the nightly window opens before the next planned wake, the device sleeps straight to morning instead of waking at the boundary — avoiding a pointless wake-and-resleep cycle.
 
-Active use overrides the window: the device won't sleep while you're interacting with it. The **Sleep After** inactivity timeout (default 3 minutes) gates all sleep, so even after the window opens you get your full browsing grace period.
+Active use overrides the window: the device won't sleep while you're interacting with it. The **Sleep After** inactivity timeout (default 1 minute) gates all sleep, every refresh keeps the device awake (and touch-responsive) for at least 15 s, and any input resets the timeout — so even after the window opens you get your full browsing grace period.
 
-> The **demo** env mirrors the timer/button wake behavior without networking. It has no RTC/NTP clock, so it ignores the sleep window and event-aware scheduling — it sleeps on the **Sleep After** inactivity timeout for the flat **Refresh Every** interval. The GPIO47 → GPIO10 touch-wake bridge described below applies to **both** envs.
+> The **demo** env mirrors the timer/button wake behavior without networking. It has no RTC/NTP clock, so it ignores the sleep window — it sleeps on the **Sleep After** inactivity timeout for the flat **Refresh Every** interval. The GPIO47 → GPIO10 touch-wake bridge described below applies to **both** envs.
 
 ## Local cache (SD card)
 
@@ -128,13 +128,12 @@ The RTC RAM cache (used for instant replay on button wakes) is the fast path; th
 The device is designed for battery operation — it spends most of its time in deep sleep (~10–150 µA) and wakes only when needed. The e-paper display retains its image with zero current between refreshes.
 
 ### Sleep scheduling
-- **Event-aware wakes** — wakes 10 minutes before the next upcoming event so the display is fresh.
-- **Periodic fallback** — wakes at most every **Refresh Every** interval (default 2h) to discover newly-added events.
+- **Periodic wake** — wakes at the **Refresh Every** interval (default 1h), aligned to the top of the hour, to discover newly-added events.
 - **Sleep window** — during the nightly window (default 10 PM–7 AM), sleeps straight through to morning. Timer wakes inside the window skip WiFi entirely.
-- **Inactivity timeout** — sleeps after **Sleep After** seconds (default 180) of no interaction.
+- **Inactivity timeout** — sleeps after **Sleep After** seconds (default 60) of no interaction; every refresh keeps the device awake at least 15 s, and any input resets the timer.
 
 ### WiFi
-- WiFi is **off during touch interaction** — disconnected after the data fetch and never reconnected.
+- WiFi is **off during touch interaction** — disconnected after the data fetch and only reconnected when fresh data is forced (button/touch wake or the Settings **Sync** button).
 - **Early disconnect** — on timer wakes, WiFi is turned off the instant the MQTT payload arrives, before the ~5s render.
 - **Reduced TX power** — limited to 17 dBm (from the default ~20 dBm), reducing peak current during WiFi active periods.
 

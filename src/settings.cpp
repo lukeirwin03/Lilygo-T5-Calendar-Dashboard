@@ -15,8 +15,8 @@ void resetToDefaults() {
   s_data.day_end_hour = 22;
   s_data.time_format_24h = false;
   s_data.context_days = 7;
-  s_data.refresh_interval_s = 7200;
-  s_data.inactivity_timeout_s = 180;
+  s_data.refresh_interval_s = 3600;
+  s_data.inactivity_timeout_s = 60;
   s_data.sleep_start_hour = 22;
   s_data.sleep_end_hour = 7;
   s_data.history_retention_d = 365;

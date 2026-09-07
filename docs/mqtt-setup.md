@@ -36,10 +36,10 @@ With `retain=true`, the flow is:
 2. WiFi connects (~3-10 seconds)
 3. MQTT subscribes to "dashboard/calendar"
 4. Broker instantly delivers the retained message
-5. Device parses, renders, disconnects WiFi, goes back to sleep
+5. Device parses the payload, disconnects WiFi, re-renders, and stays touch-responsive for a short while before sleeping
 ```
 
-Total awake time: ~15-30 seconds. Without retain, the device would sit idle for the full 8-second payload timeout, then give up.
+Total awake time: ~30-60 seconds (WiFi + render + brief interactive window). Without retain, the device would sit idle for the full 8-second payload timeout, then give up.
 
 ## Payload format
 
@@ -147,17 +147,17 @@ The device loads events within a **bidirectional window of today ± N days** int
 2. Save a deduped snapshot to `/cal/history/` if the payload changed
 3. Load only events within the 12-day window into RAM for display and scheduling
 
-Events beyond 12 days will automatically appear on the display as they enter the window (the device wakes every 2 hours to check).
+Events beyond 12 days will automatically appear on the display as they enter the window (the device wakes every hour to check).
 
 **Recommendation:** publish events for **today ± N days plus a 1–2 day buffer** (e.g. with the default N=7, publish roughly `now-9d … now+9d`, ~19 days) so the device's window is always covered despite cron timing drift. The device now consumes **both past and future events** in this range — a forward-only payload will leave the "days prior" half of the display empty. Keep the total under 4 KB; if your calendar is busy, reduce N on the device or widen the publisher's horizon. The device reads the top-level `updated` field to display a data-freshness indicator and to flag staleness, so keep it accurate.
 
 ## How updates work
 
-To add, remove, or change events, **publish a new retained message with the complete event list**. The broker replaces the old retained message. The device picks up the update on its next scheduled wake:
+To add, remove, or change events, **publish a new retained message with the complete event list**. The broker replaces the old retained message. The device picks up the update on its next wake:
 
-- **Event-aware wake** — if the changed event is sooner than 2h away and the device wakes for it
-- **Periodic wake** — within 2 hours (the `Refresh Every` interval)
-- **Button wake** — button wakes replay the OLD cached data (no WiFi). Fresh data appears on the next timer wake.
+- **Periodic wake** — within 1 hour (the `Refresh Every` interval), aligned to the top of the hour
+- **Button/touch wake** — the cached view shows instantly, then the device connects and pulls the latest retained message (fresh data re-renders ~10–30 s later)
+- **Sync button** — tapping **Sync** in the Settings modal forces a fresh pull at any time
 
 There is no incremental update mechanism — each publish replaces the entire event list.
 
@@ -292,5 +292,5 @@ Run it on a cron schedule (e.g., every 30 minutes) so the retained message stays
 | Events appear but times are wrong | Times published in UTC instead of local time | Convert to local time before publishing (offset is ignored by device) |
 | Some events missing from display | Payload over 4 KB (truncated) | Reduce the number of days or events per publish |
 | Events beyond 12 days don't appear | Working as designed — 12-day window | Events appear automatically as they enter the window |
-| Device doesn't pick up new events quickly | Timer wake interval is 2h | Reduce `Refresh Every` in settings, or wait for the next event-aware wake |
-| Button wake shows stale data | Button wakes don't connect WiFi (by design) | Fresh data appears on the next scheduled timer wake |
+| Device doesn't pick up new events quickly | Timer wake interval is 1h | Tap **Sync** in Settings, or press the button to force a refresh |
+| Button wake briefly shows old data | Cached view renders instantly; the fresh pull lands in the background | Wait ~10–30 s for the re-render — working as designed |

@@ -15,8 +15,8 @@ struct Data {
   uint8_t  context_days;        // default 7 — days of context shown each side of today (1..MAX_CONTEXT_DAYS)
 
   // Power
-  uint32_t refresh_interval_s;   // default 7200 (2 hours)
-  uint32_t inactivity_timeout_s; // default 180
+  uint32_t refresh_interval_s;   // default 3600 (1 hour)
+  uint32_t inactivity_timeout_s; // default 60 (1 minute)
   uint8_t  sleep_start_hour;     // default 22 — nightly sleep window start
   uint8_t  sleep_end_hour;       // default 7  — nightly sleep window end
   uint32_t history_retention_d;  // default 365

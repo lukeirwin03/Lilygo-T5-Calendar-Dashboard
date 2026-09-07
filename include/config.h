@@ -16,15 +16,14 @@ namespace config {
   constexpr const char*    MQTT_TOPIC     = "dashboard/calendar";
 
   // -- Power / sleep --
-  // Sleep after this many ms of no touch activity while awake.
-  constexpr unsigned long INACTIVITY_TIMEOUT_MS = 5UL * 60UL * 1000UL;
   // Hard cap on how long the scheduled wake waits for MQTT payload.
   constexpr unsigned long PAYLOAD_WAIT_MS = 8000;
   // SNTP sync timeout on cold boot.
   constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
-  // Wake this many seconds before an event starts, giving the display time to
-  // refresh so upcoming events appear with a comfortable lead.
-  constexpr unsigned long EVENT_WAKE_LEAD_S = 600;  // 10 minutes
+  // After any wake/refresh completes, stay awake (touch-responsive) for at
+  // least this long so the user can interact right after an update. Input
+  // after that extends the session via the inactivity timeout.
+  constexpr unsigned long POST_REFRESH_AWAKE_MS = 15000;
   // Calendar context window. The device loads events spanning today ± N days
   // (today, the N days before, and the N days after) into RAM and clamps
   // day-navigation to that range. N is the user-adjustable "Context Days"

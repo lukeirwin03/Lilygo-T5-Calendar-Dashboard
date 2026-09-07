@@ -26,7 +26,17 @@ size_t NUM_DASHBOARDS = sizeof(dashboards) / sizeof(dashboards[0]);
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-static unsigned long lastActivityMs = 0;
+// Last touch/button input. Feeds the inactivity check in loop().
+static unsigned long lastInputMs = 0;
+// Guaranteed-awake floor, (re)set after any render that completes following
+// a refresh (the setup wake paths set it after their final render; loop()
+// resets it whenever a render runs): the device stays touch-responsive at
+// least this long even with no input, so the multi-second render itself
+// can't eat the window. Sleeps only after the floor passes AND the
+// inactivity timeout has expired with no input. (lastInputMs starts at 0,
+// so with no input the device sleeps at the floor once millis() exceeds the
+// timeout — i.e. between 15 s and one timeout after the render completes.)
+static unsigned long minAwakeUntilMs = 0;
 static unsigned long lastHeartbeatMs = 0;
 static bool needsFullRender = true;
 static unsigned long lastButtonMs = 0;
@@ -72,11 +82,12 @@ static void syncEventsToUI() {
   }
 }
 
-static void doRender() {
+// Renders if anything is pending; returns true when a render was performed.
+static bool doRender() {
   // Always consume the UI pending flag so a full render doesn't leave a
   // stale partial-refresh request for the next loop iteration.
   bool uiPending = ui::needsRender();
-  if (!needsFullRender && !uiPending) return;
+  if (!needsFullRender && !uiPending) return false;
 
   if (needsFullRender) {
     // Full refresh — screen change, wake, or new data. Discard any pending
@@ -115,6 +126,7 @@ static void doRender() {
 
   needsFullRender = false;
   calendarDash.dirty = false;  // a render consumes any pending "new data" flag
+  return true;
 }
 
 static void handleTouch() {
@@ -122,7 +134,7 @@ static void handleTouch() {
   int16_t x = 0, y = 0;
   if (touched) {
     touch_input::poll(x, y);
-    lastActivityMs = millis();
+    lastInputMs = millis();
   }
   ui::updateTouch(touched, x, y);
 }
@@ -165,36 +177,23 @@ static unsigned long msUntilWindowStart(time_t now, const struct tm& lt) {
   return (unsigned long)diffSec * 1000UL;
 }
 
-// Earliest start epoch of a future, non-all-day event whose scheduled wake-up
-// (start minus lead time) is still ahead of `now`. Returns 0 if none.
-// All-day events are skipped — they have no meaningful "about to start" moment
-// and are caught by the periodic fallback.
-static time_t nextEventStartAfter(time_t now) {
-  time_t best = 0;
-  for (int i = 0; i < calendarDash.eventCount(); i++) {
-    const CalendarEvent& ev = calendarDash.events()[i];
-    if (ev.allDay) continue;
-
-    int y, m, d;
-    if (sscanf(ev.date, "%d-%d-%d", &y, &m, &d) != 3) continue;
-    struct tm etm;
-    memset(&etm, 0, sizeof(etm));
-    etm.tm_year  = y - 1900;
-    etm.tm_mon   = m - 1;
-    etm.tm_mday  = d;
-    etm.tm_hour  = ev.startHour;
-    etm.tm_min   = ev.startMin;
-    etm.tm_sec   = 0;
-    etm.tm_isdst = -1;  // let the system determine DST
-    time_t start = mktime(&etm);
-
-    // Only schedule a wake for events whose lead-time wake-up is still in the
-    // future. Events already inside the lead window were either refreshed on a
-    // prior wake or will be caught by the periodic cap.
-    if (start - (time_t)config::EVENT_WAKE_LEAD_S <= now) continue;
-    if (best == 0 || start < best) best = start;
+// Connect WiFi/MQTT, pull the latest retained payload, disconnect.
+// freshOnly=true waits for a message arriving during this call (used when a
+// cached view is already on screen); false accepts any data. Returns true if
+// a payload arrived. WiFi is always disconnected before returning.
+static bool backgroundRefresh(bool freshOnly) {
+  networking::connectWiFi();
+  networking::waitForTimeSync(config::NTP_SYNC_TIMEOUT_MS);
+  bool got = false;
+  if (networking::isWiFiConnected()) {
+    networking::connectMqtt();
+    got = freshOnly ? networking::pumpForFreshPayload(config::PAYLOAD_WAIT_MS)
+                    : networking::pumpForPayload(config::PAYLOAD_WAIT_MS);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[wifi] Disconnected to save power");
   }
-  return best;
+  return got;
 }
 
 static unsigned long calculateSleepMs() {
@@ -214,23 +213,20 @@ static unsigned long calculateSleepMs() {
     return sleepUntilWindowEndMs(now, lt);
   }
 
-  // Fallback: the periodic cap guarantees we wake often enough to discover
-  // events added to MQTT while we were asleep.
-  unsigned long sleepMs = cfg.refresh_interval_s * 1000UL;
-
-  // Event-aware: wake shortly before the next upcoming event so the display
-  // is fresh when something is about to happen.
-  time_t nextEv = nextEventStartAfter(now);
-  if (nextEv > 0) {
-    long diffSec = (long)difftime(nextEv, now) - (long)config::EVENT_WAKE_LEAD_S;
-    if (diffSec < 60) diffSec = 60;  // clamp to avoid tight wake loops
-    unsigned long eventMs = (unsigned long)diffSec * 1000UL;
-    if (eventMs < sleepMs) sleepMs = eventMs;
-  }
+  // Periodic wake aligned to the interval boundary measured from the top of
+  // the hour (hourly -> wakes at :00:10 each hour; 30 min -> :00/:30), so
+  // updates happen at a predictable wall-clock time. +10s lands just past
+  // the boundary so the retained message is freshly published.
+  unsigned long intervalS = cfg.refresh_interval_s;
+  if (intervalS < 60) intervalS = 60;  // safety clamp
+  long intoHourS = (long)lt.tm_min * 60L + (long)lt.tm_sec;
+  long intervalL = (long)intervalS;
+  long toBoundaryS = intervalL - (intoHourS % intervalL) + 10;
+  if (toBoundaryS < 60) toBoundaryS += intervalL;  // no tight wake loop at the boundary
+  unsigned long sleepMs = (unsigned long)toBoundaryS * 1000UL;
 
   // If the sleep window opens before our next planned wake, skip straight to
-  // morning. This avoids a wasteful wake-then-resleep at the boundary, and
-  // means events during sleep hours never wake the device.
+  // morning. This avoids a wasteful wake-then-resleep at the boundary.
   if (cfg.sleep_start_hour > cfg.sleep_end_hour) {
     unsigned long toWindowMs = msUntilWindowStart(now, lt);
     if (toWindowMs < sleepMs) {
@@ -311,25 +307,9 @@ void setup() {
     }
 
     // --- WiFi / NTP / MQTT refresh ---
-    networking::connectWiFi();
-    networking::waitForTimeSync(config::NTP_SYNC_TIMEOUT_MS);
-
-    bool gotFreshData = false;
-    if (networking::isWiFiConnected()) {
-      networking::connectMqtt();
-      // If we already rendered from cache, wait for NEW data specifically
-      // (pumpForFreshPayload). Otherwise, wait for any data (pumpForPayload).
-      if (renderedFromCache) {
-        gotFreshData = networking::pumpForFreshPayload(config::PAYLOAD_WAIT_MS);
-      } else {
-        gotFreshData = networking::pumpForPayload(config::PAYLOAD_WAIT_MS);
-      }
-      // Disconnect WiFi as soon as we have the payload — the render and
-      // interactive period don't need network, and WiFi is the biggest draw.
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      Serial.println("[wifi] Disconnected to save power");
-    }
+    // If we already rendered from cache, only genuinely new data triggers a
+    // re-render (freshOnly=true); otherwise any data will do.
+    bool gotFreshData = backgroundRefresh(renderedFromCache);
 
     // If still no data (MQTT failed), fall back to caches (no WiFi needed).
     if (!calendarDash.hasData) {
@@ -347,11 +327,11 @@ void setup() {
       needsFullRender = true;
     }
 
-    lastActivityMs = millis();
+    minAwakeUntilMs = millis() + config::POST_REFRESH_AWAKE_MS;
   }
 
   // -------------------------------------------------------------------------
-  // TIMER WAKE → quick data refresh then back to sleep
+  // TIMER WAKE → refresh from MQTT, render, then stay briefly interactive
   // -------------------------------------------------------------------------
   else if (wake == power_mgr::WAKE_TIMER) {
     // If RTC says we're inside the sleep window, skip the expensive WiFi
@@ -366,19 +346,8 @@ void setup() {
       }
     }
 
-    networking::connectWiFi();
-    networking::waitForTimeSync(3000);
-
-    if (networking::isWiFiConnected()) {
-      networking::connectMqtt();
-      if (networking::pumpForPayload(config::PAYLOAD_WAIT_MS)) {
-        needsFullRender = true;
-      }
-      // Disconnect WiFi as soon as we have the payload — the render and sleep
-      // don't need network, and WiFi is the single biggest power draw.
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      Serial.println("[wifi] Disconnected after payload");
+    if (backgroundRefresh(false)) {
+      needsFullRender = true;
     }
 
     if (!calendarDash.hasData) {
@@ -391,21 +360,29 @@ void setup() {
 
     syncEventsToUI();
     doRender();
-    enterSleep("timer wake done");
+    minAwakeUntilMs = millis() + config::POST_REFRESH_AWAKE_MS;
+    // Fall through to loop(): the device stays touch-responsive for the
+    // post-refresh floor, then sleeps via the inactivity timeout.
   }
 
   // -------------------------------------------------------------------------
-  // BUTTON / TOUCH WAKE → replay cached data, stay awake for interaction
+  // BUTTON / TOUCH WAKE → instant cache view, then background data refresh
   // -------------------------------------------------------------------------
   else {
-    if (networking::hasCachedPayload()) {
-      networking::replayCachedPayload();
-    } else {
-      networking::replaySDPayload();
-    }
+    // Instant view from cache, then pull fresh data in the background
+    // (button wake = force update). Re-render happens in loop() when the
+    // fresh payload lands.
+    if (networking::hasCachedPayload()) networking::replayCachedPayload();
+    else networking::replaySDPayload();
     syncEventsToUI();
     needsFullRender = true;
-    lastActivityMs = millis();
+    doRender();
+    if (backgroundRefresh(true)) needsFullRender = true;
+    syncEventsToUI();
+    // The user woke the device to browse — the blocking refresh shouldn't
+    // count against their inactivity budget.
+    lastInputMs = millis();
+    minAwakeUntilMs = millis() + config::POST_REFRESH_AWAKE_MS;
   }
 }
 
@@ -430,6 +407,14 @@ void loop() {
     needsFullRender = true;
   }
 
+  // "Sync" button in the settings modal: force a fresh MQTT pull mid-session.
+  if (ui::consumeManualRefreshRequest()) {
+    backgroundRefresh(true);
+    syncEventsToUI();
+    lastInputMs = millis();  // treat the tap as input: don't let the blocking refresh eat the timeout
+    minAwakeUntilMs = millis() + config::POST_REFRESH_AWAKE_MS;
+  }
+
   // If new MQTT data arrived during networking::loop(), feed it to the UI
   if (calendarDash.dirty) {
     calendarDash.dirty = false;
@@ -441,13 +426,17 @@ void loop() {
   if (digitalRead(config::BUTTON_PIN) == LOW) {
     if (now - lastButtonMs > 300) {
       lastButtonMs = now;
-      lastActivityMs = now;
+      lastInputMs = now;
       ui::toggleSettings();
       Serial.println("[button] Toggle settings");
     }
   }
 
-  doRender();
+  if (doRender()) {
+    // A render just completed — restart the guaranteed-awake window so the
+    // user gets the full floor of touch time on the fresh image.
+    minAwakeUntilMs = millis() + config::POST_REFRESH_AWAKE_MS;
+  }
 
   // Re-read the clock after rendering — the render takes seconds and
   // without a fresh timestamp the unsigned subtraction can underflow.
@@ -457,9 +446,9 @@ void loop() {
   // gated on inactivity, so active use (touch/button) keeps the device awake
   // even after the window opens. The sleep *duration* (computed by
   // calculateSleepMs via enterSleep) decides whether to sleep until morning
-  // (in window) or until the next event / periodic cap.
+  // (in window) or to the next interval boundary.
   unsigned long inactivityMs = settings::get().inactivity_timeout_s * 1000UL;
-  if (now - lastActivityMs > inactivityMs) {
+  if (now >= minAwakeUntilMs && now - lastInputMs >= inactivityMs) {
     const char* reason = "inactivity timeout";
     time_t tnow = time(nullptr);
     if (tnow >= MIN_REASONABLE_EPOCH) {
@@ -468,7 +457,13 @@ void loop() {
     }
     ui::resetToDefaultView();
     doRender();
-    enterSleep(reason);
+    // A touch landing during the multi-second goodnight render would be
+    // invisible to the sleep decision — re-check and stay awake if touched.
+    if (touch_input::isTouched()) {
+      lastInputMs = millis();
+    } else {
+      enterSleep(reason);
+    }
   }
 
   if (now - lastHeartbeatMs > config::HEARTBEAT_MS) {

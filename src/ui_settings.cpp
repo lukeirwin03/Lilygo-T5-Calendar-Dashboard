@@ -315,13 +315,14 @@ static void closeBtnRect(int& cx, int& cy, int& cw, int& ch) {
   cy = MODAL_Y + (TITLE_H - ch) / 2;   // vertically centered in the title bar
 }
 
-static void bottomBtnRects(int& minusX, int& plusX, int& saveX, int& saveW, int& btnY, int& btnSize) {
+static void bottomBtnRects(int& minusX, int& plusX, int& saveX, int& saveW, int& btnY, int& btnSize, int& syncX) {
   btnSize = 48;
   btnY = MODAL_BOTTOM - BOTTOM_H + (BOTTOM_H - btnSize) / 2;
   minusX = MODAL_X + MARGIN + 40;
   plusX  = minusX + btnSize + 24;
   saveW  = 120;
   saveX  = MODAL_RIGHT - MARGIN - saveW;
+  syncX  = saveX - 24 - saveW;   // Sync button: same size as Save, 24px gap to its left
 }
 
 // ---------------------------------------------------------------------------
@@ -420,8 +421,8 @@ static void drawTabs(uint8_t* fb) {
 }
 
 static void drawBottomBar(uint8_t* fb) {
-  int minusX, plusX, saveX, saveW, btnY, btnSize;
-  bottomBtnRects(minusX, plusX, saveX, saveW, btnY, btnSize);
+  int minusX, plusX, saveX, saveW, btnY, btnSize, syncX;
+  bottomBtnRects(minusX, plusX, saveX, saveW, btnY, btnSize, syncX);
 
   // Separator line at the top of the bottom region.
   epd_draw_hline(MODAL_X + MARGIN, MODAL_BOTTOM - BOTTOM_H,
@@ -454,6 +455,23 @@ static void drawBottomBar(uint8_t* fb) {
     int32_t mcx = saveX, mcy = btnY + btnSize / 2 + 6;
     get_text_bounds((GFXfont*)&MeltSwashes16, txt, &mcx, &mcy, &tx1, &ty1, &tw, &th, NULL);
     int32_t lx = saveX + (saveW - tw) / 2, ly = btnY + btnSize / 2 + 6;
+    FontProperties props;
+    props.fg_color = C_WHITE;
+    props.bg_color = C_DKGRAY;
+    props.flags = 0;
+    props.fallback_glyph = 0;
+    write_mode((GFXfont*)&MeltSwashes16, txt, &lx, &ly, fb, BLACK_ON_WHITE, &props);
+  }
+
+  // Sync button (same style as Save, immediately to its left)
+  epd_fill_rect(syncX, btnY, saveW, btnSize, EPD_DKGRAY, fb);
+  epd_draw_rect(syncX, btnY, saveW, btnSize, EPD_BLACK, fb);
+  {
+    const char* txt = "Sync";
+    int32_t tw = 0, th = 0, tx1 = 0, ty1 = 0;
+    int32_t mcx = syncX, mcy = btnY + btnSize / 2 + 6;
+    get_text_bounds((GFXfont*)&MeltSwashes16, txt, &mcx, &mcy, &tx1, &ty1, &tw, &th, NULL);
+    int32_t lx = syncX + (saveW - tw) / 2, ly = btnY + btnSize / 2 + 6;
     FontProperties props;
     props.fg_color = C_WHITE;
     props.bg_color = C_DKGRAY;
@@ -612,8 +630,21 @@ TapResult handleTap(int16_t x, int16_t y) {
   }
 
   // Bottom bar buttons
-  int minusX, plusX, saveX, saveW, btnY, btnSize;
-  bottomBtnRects(minusX, plusX, saveX, saveW, btnY, btnSize);
+  int minusX, plusX, saveX, saveW, btnY, btnSize, syncX;
+  bottomBtnRects(minusX, plusX, saveX, saveW, btnY, btnSize, syncX);
+
+  // Sync: force a fresh MQTT pull (handled by the main loop). Mirrors the
+  // Close button's pending-context-days handling, then closes the modal so
+  // the refreshed view is what the user sees.
+  if (x >= syncX && x <= syncX + saveW && y >= btnY && y <= btnY + btnSize) {
+    if (s_contextDaysChanged) {
+      s_contextDaysChanged = false;
+      ui::requestEventReload();
+    }
+    ui::requestManualRefresh();
+    Serial.println("[settings] Sync requested");
+    return TAP_CLOSE;
+  }
 
   // Save
   if (x >= saveX && x <= saveX + saveW && y >= btnY && y <= btnY + btnSize) {
