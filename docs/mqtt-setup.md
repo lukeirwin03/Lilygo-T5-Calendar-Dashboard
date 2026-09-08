@@ -43,7 +43,7 @@ Total awake time: ~30-60 seconds (WiFi + render + brief interactive window). Wit
 
 ## Payload format
 
-Publish a JSON object with an `events` array. The device only reads the `events` key — any other top-level fields (like `updated` or `horizon_days`) are ignored by the device but useful for your own tracking.
+Publish a JSON object with an `events` array. The device reads the `events` key plus the optional top-level `updated` timestamp (used for the data-freshness display in Settings → Diagnostics); any other top-level fields (like `horizon_days`) are ignored by the device but useful for your own tracking.
 
 ### Minimal example
 
@@ -145,11 +145,11 @@ The device loads events within a **bidirectional window of today ± N days** int
 **You can publish events of any date range** — the device will:
 1. Save the full payload to `/cal/current.json` on the SD card
 2. Save a deduped snapshot to `/cal/history/` if the payload changed
-3. Load only events within the 12-day window into RAM for display and scheduling
+3. Load only events within the 15-day window (today ± 7 with default settings) into RAM for display and scheduling
 
-Events beyond 12 days will automatically appear on the display as they enter the window (the device wakes every hour to check).
+Events beyond the window will automatically appear on the display as they enter it (the device wakes every hour to check).
 
-**Recommendation:** publish events for **today ± N days plus a 1–2 day buffer** (e.g. with the default N=7, publish roughly `now-9d … now+9d`, ~19 days) so the device's window is always covered despite cron timing drift. The device now consumes **both past and future events** in this range — a forward-only payload will leave the "days prior" half of the display empty. Keep the total under 4 KB; if your calendar is busy, reduce N on the device or widen the publisher's horizon. The device reads the top-level `updated` field to display a data-freshness indicator and to flag staleness, so keep it accurate.
+**Recommendation:** publish events for **today ± N days plus a 1–2 day buffer** (e.g. with the default N=7, publish roughly `now-9d … now+9d`, ~19 days) so the device's window is always covered despite cron timing drift. The device consumes **both past and future events** in this range — a forward-only payload will leave the "days prior" half of the display empty (past days are also backfilled from the on-device day cache, but that only has data the device has already seen). Keep the total under 4 KB; if your calendar is busy, reduce N on the device or widen the publisher's horizon. The device reads the top-level `updated` field for the **Last Updated** diagnostic, so keep it accurate.
 
 ## How updates work
 
@@ -287,10 +287,11 @@ Run it on a cron schedule (e.g., every 30 minutes) so the retained message stays
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Device shows "Connecting..." for a long time on cold boot | Broker unreachable or credentials wrong | Check `MQTT_HOST`, `MQTT_USER`, `MQTT_PASS` in config/secrets |
+| Connection screen stalls on "Connecting to WiFi" / shows "WiFi unavailable" | WiFi credentials wrong or AP unreachable | Check `WIFI_SSID`/`WIFI_PASSWORD` in secrets.h, and AP power |
+| Stuck on "Connecting to broker" / "Broker unreachable" | Broker unreachable or credentials wrong | Check `MQTT_HOST`, `MQTT_USER`, `MQTT_PASS` in config/secrets |
 | Device connects but shows no events | `retain=true` not set on the publish | Re-publish with `-r` flag |
 | Events appear but times are wrong | Times published in UTC instead of local time | Convert to local time before publishing (offset is ignored by device) |
 | Some events missing from display | Payload over 4 KB (truncated) | Reduce the number of days or events per publish |
-| Events beyond 12 days don't appear | Working as designed — 12-day window | Events appear automatically as they enter the window |
+| Events beyond the ±Context-Days window don't appear | Working as designed — 15-day window with default N=7 | Events appear automatically as they enter the window |
 | Device doesn't pick up new events quickly | Timer wake interval is 1h | Tap **Sync** in Settings, or press the button to force a refresh |
 | Button wake briefly shows old data | Cached view renders instantly; the fresh pull lands in the background | Wait ~10–30 s for the re-render — working as designed |

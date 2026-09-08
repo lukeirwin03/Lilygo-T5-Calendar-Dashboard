@@ -22,6 +22,8 @@ All pins and network constants live in [`include/config.h`](include/config.h).
 | `demo` | UI prototyping with hardcoded test events | `src/main.cpp` | No | Optional |
 | `dashboard` | Production firmware | `src/main_dashboard.cpp` | Yes | Yes |
 
+The demo build is the photo/manual-test build: it plays the connection-screen animation at boot (touch or button skips it), runs a **simulated clock** starting at 9:42 AM on the boot date, and **long-pressing the button jumps the clock +2h** (wrapping past midnight back to 6 AM) — so every sliding-window state (morning ▲ clamp, mid-day slide, freeze at the last event, evening ▼ clamp) and the scroll arrows can be walked through and photographed without waiting for real time to pass.
+
 ```bash
 pio run -e demo -t upload          # flash demo (no WiFi needed)
 pio run -e dashboard -t upload     # flash production
@@ -40,12 +42,16 @@ A 3-column **focus+context** layout:
 
 Focus column features:
 - Event blocks sized proportionally to duration, with lane splitting for overlapping events
-- Dynamic timeline range: 1 hour before earliest event to 1 hour after latest, snapped to the next nice duration
+- **Today (clock set): a sliding timeline window.** Anchored at the **Day Start** setting, it follows *now − 1h* as the day progresses (each wake's re-render slides it forward), always extends past the next upcoming event (minimum 6 hours), and **freezes at the last event** — so the last event stays pinned at the top of the window for the rest of the day. Past events scroll up off the top; bring them back with the scroll-up arrow
+- **Other days (or unset clock): a deterministic event window** — 1 hour before the earliest event to 1 hour after the latest, snapped to the next nice duration (6h, 9h, 12h, 18h, or 24h), clamped to 4 AM–4 AM. Identical on every render
 - Boundary lines at the top and bottom show the time range (e.g., "8:00 AM" and "7:00 PM")
 - Two grid lines at 1/3 and 2/3 of the timeline
 - Faint gray fill in gaps between events (>60 min)
 - Time range shown at the top of each block (e.g., "2:00 - 6:00 PM")
-- All-day events shown in a black banner above the timeline
+- All-day events shown in a black banner above the timeline (with ← / → continuation arrows for multi-day events)
+- **Now marker** — two small chevrons pointing at each other ('> · <', white-haloed) near the column edges at the current time on today's focus column. When "now" is outside the window the pair clamps just inside the boundary with an extra chevron pointing at the off-screen direction (▲ early morning, ▼ after the frozen end) — the marker never lies about where "now" is
+- **Scroll arrows** — small chevron buttons (24 px visuals, much larger tap zones) appear at the top-right/bottom-right of today's timeline only when events are clipped off that edge. Tap ▲ to page back to scrolled-off past events, ▼ to return toward the live window; the offset resets on the next data refresh or navigation. Scrolling renders with a fast **no-clear ghost refresh** of the focus column — prior timeline frames leave faint ghosts (an intentional experiment in trading ghosting for snappiness); the next full refresh cleans the panel
+- At the edge of the ±Context-Days window the adjacent context column is hidden entirely, making the navigation boundary obvious
 
 Context column features:
 - Ultra-compact 12-hour time ranges: "9:00-10:00AM" (same half) or "11:30A-1:00P" (crossing AM/PM)
@@ -58,6 +64,7 @@ Single-day view with a tear-off calendar widget, a 3-button nav container, and a
 
 - **Left column**: 220px tear-off calendar (day name + number) + a **daily nav container** with three buttons: ◀ (previous day), **Back to Week**, and ▶ (next day)
 - **Right column**: Compact 2-line event rows (time range + title, 60px each, alternating stripes)
+- A gray **status strip** across the top shows the event counts (e.g., "Events: 4 | All-day: 1") and, when viewing today with the clock set, the current time ("Now 3:42 PM")
 - **Tap any event row** → switches the right column to a **detail view** showing full event info (title, time range, location, description, calendar source) with a "← Back to list" button
 - Detail transitions use **partial refresh** (only the right column refreshes, ~2s instead of ~5s full refresh)
 
@@ -80,16 +87,18 @@ Single-day view with a tear-off calendar widget, a 3-button nav container, and a
 
 Tap the physical button to open the **Settings modal** (tap the button again, or tap **Close** inside the modal, to dismiss). The modal opens as a partial-refresh overlay and shows:
 
-- A **battery readout** at the top
+- A **battery readout** in the title bar (glyph + percentage)
 - A **Display** tab — Day Start, Day End, Time Format (12h/24h), Context Days (days of context shown each side of today, 1–7)
 - A **Power** tab — Refresh Every, Sleep After, Sleep Starts, Sleep Ends, Keep History
+- A **Diagnostics** tab — Last Updated (age of the displayed payload, from its `updated` field), WiFi (on/off + RSSI), MQTT (connected/off), Battery, free Memory
+- **− / +** buttons cycle the selected row's value; **Save** persists all values to the SD card and closes the modal
 - A **Sync** button next to **Save** — forces a fresh MQTT pull (the modal closes; the display re-renders when fresh data lands, ~10–30 s later) (dashboard env only — the demo build has no networking)
 
 **Time Format (12h/24h)** toggles event times between 12-hour (`3:30 PM`) and 24-hour (`15:30`) display across the weekly and daily views.
 
 **Sleep After** is the inactivity timeout (default 1 minute): once the device has been idle for that long it resets the display to the weekly-today view, renders it, and goes to deep sleep. This timeout also gates the nightly window — active use keeps the device awake even after the window opens.
 
-**Sleep Starts / Sleep Ends** define the nightly deep-sleep window (default 10 PM – 7 AM). During this window the device sleeps straight through until the end hour — timer wakes that land inside the window skip the WiFi refresh entirely and go back to sleep. Events that fall inside the window do **not** trigger a wake. This scheduled window applies to the **dashboard** env only — the **demo** env has no RTC/NTP clock, so it ignores it and still sleeps on the **Sleep After** inactivity timeout.
+**Sleep Starts / Sleep Ends** define the nightly deep-sleep window (default 10 PM – 7 AM). During this window the device sleeps straight through until the end hour — timer wakes that land inside the window skip the WiFi refresh entirely and go back to sleep. Events that fall inside the window do **not** trigger a wake. This scheduled window applies to the **dashboard** env only — the **demo** env runs a simulated clock and ignores the window, sleeping on the **Sleep After** inactivity timeout.
 
 Changes are persisted to `/config/settings.json` on the SD card when a card is present; otherwise the defaults are used for the session.
 
@@ -97,13 +106,13 @@ Changes are persisted to `/config/settings.json` on the SD card when a card is p
 
 The device spends almost all its time in deep sleep (~10–150 µA) and wakes on three triggers:
 
-1. **Cold boot** — load cached payload from SD and render immediately (if the RTC clock is valid), then connect WiFi/MQTT in the background and re-render if the broker delivers a fresh payload
+1. **Cold boot** — load cached payload from SD and render immediately (if the RTC clock is valid), then connect WiFi/MQTT in the background and re-render if the broker delivers a fresh payload. If there is no usable cache (first boot, or power loss with the clock unset), a stylized **connection screen** takes over: a wordmark, a progress bar, and a live stage label ("Connecting to WiFi… → Syncing clock… → Connecting to broker… → Fetching calendar…") updated with cleared partial refreshes of just the status band (the brief band flash is the physical erase), with failure labels ("WiFi unavailable", "Broker unreachable", …) when a stage fails.
 2. **Timer wake** — refresh WiFi/MQTT, render latest data, stay touch-responsive for at least 15 s, go back to sleep
 3. **Button/touch wake** — show the cached payload instantly, then connect and pull the latest retained message in the background (fresh data re-renders ~10–30 s later); sleep after inactivity
 
 ### How long it sleeps (dashboard env)
 
-Sleep duration is chosen to be as short as needed but no shorter, picking the earliest of:
+Sleep duration is the next periodic boundary, adjusted for the nightly window:
 
 - **Periodic wake** — the device wakes at the **Refresh Every** interval (default 1 hour), aligned to the top of the hour — just past :00, or on the interval boundary for sub-hour settings. This is the freshness guarantee: any event added to the MQTT source while the device sleeps is discovered within one interval.
 - **Sleep window** — during the nightly window (default 10 PM – 7 AM) the device skips all of the above and sleeps straight through to morning. Timer wakes that land inside the window detect it from the RTC and go back to sleep without turning on WiFi. Events during the window do not trigger a wake.
@@ -112,14 +121,16 @@ If the nightly window opens before the next planned wake, the device sleeps stra
 
 Active use overrides the window: the device won't sleep while you're interacting with it. The **Sleep After** inactivity timeout (default 1 minute) gates all sleep, every refresh keeps the device awake (and touch-responsive) for at least 15 s, and any input resets the timeout — so even after the window opens you get your full browsing grace period.
 
-> The **demo** env mirrors the timer/button wake behavior without networking. It has no RTC/NTP clock, so it ignores the sleep window — it sleeps on the **Sleep After** inactivity timeout for the flat **Refresh Every** interval. The GPIO47 → GPIO10 touch-wake bridge described below applies to **both** envs.
+> The **demo** env mirrors the timer/button wake behavior without networking. It runs a simulated clock (no NTP), so it ignores the sleep window — it sleeps on the **Sleep After** inactivity timeout for the flat **Refresh Every** interval. The GPIO47 → GPIO10 touch-wake bridge described below applies to **both** envs.
 
 ## Local cache (SD card)
 
 Every MQTT payload is persisted to the SD card so the device works without a network connection and survives power loss:
 
-- **`/cal/current.json`** — the latest raw payload. On cold boot this is loaded and rendered immediately (before WiFi connects), so the calendar appears in ~2 seconds instead of waiting ~30 seconds for a network connection. The background WiFi refresh updates it if the broker delivers a fresh payload. *(Requires a valid RTC clock; on a true power-loss boot the clock starts unset, so the splash screen shows until NTP syncs.)*
+- **`/cal/current.json`** — the latest raw payload. On cold boot this is loaded and rendered immediately (before WiFi connects), so the calendar appears in ~2 seconds instead of waiting ~30 seconds for a network connection. The background WiFi refresh updates it if the broker delivers a fresh payload. *(Requires a valid RTC clock; on a true power-loss boot the clock starts unset, so the connection screen shows while NTP syncs.)*
+- **`/cal/cache/YYYY-MM-DD.json`** — a per-day cache of parsed events. When a fresh payload arrives, every day it covers is written to its own cache file so the recent-past side of the ±Context-Days window stays filled as events age out of the published horizon. On each payload the cached past days are merged back in and **deduplicated** against payload events (same date, title, start time, all-day flag, and calendar = same occurrence), so an event present in both sources renders exactly once. Entries older than 28 days are evicted at boot.
 - **`/cal/history/YYYY-MM-DD.jsonl`** — a deduped historical record. A new JSONL entry is appended only when the payload changes (detected via a checksum stored in RTC memory that survives deep sleep). Old entries are pruned by the **Keep History** retention setting (default 365 days).
+- **`/logs/YYYY-MM-DD.log`** — serial-style diagnostic logs, pruned by the same retention setting.
 
 The RTC RAM cache (used for instant replay on button wakes) is the fast path; the SD card is the persistent fallback that survives power loss.
 
@@ -173,7 +184,7 @@ publisher (cron/script/integration)
 **Topic:** `dashboard/calendar`
 
 The MQTT buffer is 4 KB. The publisher **must** set `retain=true`.
-A discreet freshness indicator at the top of the screen shows the payload's data age and flags staleness (in a darker shade, prefixed with `!`) when the broker hasn't published within twice the Refresh Every interval.
+The payload's top-level `updated` timestamp drives the **Last Updated** row in Settings → Diagnostics (shown as data age, e.g. "2h ago") — keep it accurate so staleness is visible there.
 
 See [`docs/mqtt-setup.md`](docs/mqtt-setup.md) for the full broker contract — payload format, field limits, retain behavior, and `mosquitto_pub`/`mosquitto_sub` testing commands.
 
@@ -228,7 +239,8 @@ project-root/
 │   ├── dashboard.h             ← abstract Dashboard base class
 │   ├── battery.h
 │   ├── display_manager.h       ← framebuffer, full/partial refresh
-│   ├── networking.h            ← WiFi, MQTT, RTC payload cache
+│   ├── conn_screen.h           ← cold-boot connection screen w/ progress
+│   ├── networking.h            ← WiFi, MQTT, RTC payload cache, progress listener
 │   ├── power_mgr.h             ← deep sleep + wake reason
 │   ├── touch_input.h           ← GT911 touch driver
 │   ├── settings.h              ← runtime settings struct (SD card)
@@ -243,6 +255,7 @@ project-root/
 │   ├── main_dashboard.cpp      ← production entry point (MQTT, SD, sleep)
 │   ├── ui.cpp                  ← all rendering + touch state machine (~2000 lines)
 │   ├── ui_settings.cpp         ← settings screen rendering + touch
+│   ├── conn_screen.cpp         ← connection screen: wordmark, progress bar, partial updates
 │   ├── display_manager.cpp     ← PSRAM framebuffer, fullRefresh, partialRefresh
 │   ├── networking.cpp          ← WiFi + MQTT lifecycle, SNTP, RTC cache
 │   ├── power_mgr.cpp           ← wake reason detection, deep sleep
@@ -263,8 +276,9 @@ project-root/
 - **`ui.cpp`** — All rendering (weekly focus+context, daily list/detail) and the touch state machine. Manages screen state, navigation, partial refresh coordination, and the dynamic timeline.
 - **`ui_settings.cpp`** — Settings screen with sidebar navigation, value cycling, and partial refresh for row updates.
 - **`main.cpp`** / **`main_dashboard.cpp`** — Entry points for demo and production. Handle wake routing, touch polling, render scheduling, and sleep logic.
-- **`display_manager.cpp`** — PSRAM framebuffer allocation, full refresh, partial refresh (with full-width draw to avoid EPD edge ghosting).
-- **`networking.cpp`** — WiFi/MQTT lifecycle, SNTP time sync, RTC-RAM payload cache for offline wake.
+- **`conn_screen.cpp`** — Cold-boot connection screen: wordmark + progress bar, stage labels, and throttled partial refreshes of just the status band while connecting.
+- **`display_manager.cpp`** — PSRAM framebuffer allocation, full refresh, cleared partial refresh, and no-clear ghost refresh (both draw full-width rows to avoid EPD edge artifacts).
+- **`networking.cpp`** — WiFi/MQTT lifecycle, SNTP time sync, RTC-RAM payload cache for offline wake, and an optional progress listener the connection screen subscribes to.
 - **`dashboards/calendar_dashboard.cpp`** — JSON event parsing, all-day event expansion, shade assignment. Does NOT render (rendering is in `ui.cpp`).
 - **`settings.cpp`** — Runtime settings struct loaded from `/config/settings.json` on SD card.
 - **`sd_storage.cpp`** — SD card mount, config file read/write, log management with retention cleanup.
@@ -295,6 +309,6 @@ The pipeline generates GFXfont headers for:
 
 - The panel retains its last image with zero current draw between deep sleeps.
 - WiFi is disconnected the moment the MQTT payload arrives, before the render — the render and deep sleep don't need network, and WiFi is the single biggest power draw (~120–500 mA active vs. ~10–150 µA in deep sleep).
-- Touch wake from deep sleep requires a hardware bridge from GPIO47 (TOUCH_INT) to GPIO10 (TOUCH_WAKE_PIN) because GPIO47 is not RTC-capable. Without the bridge, only the button can wake from deep sleep.
-- The demo environment includes touch diagnostics (heartbeat, init-failure logging) and 26 hardcoded test events covering edge cases (overlaps, gaps, all-day, cross-midnight, long titles).
-- Partial refresh is used for daily list↔detail transitions to avoid full-screen flashing. The technique draws at full width but clears only the sub-region to prevent EPD edge ghosting.
+- Touch wake from deep sleep requires **both** a hardware bridge from GPIO47 (TOUCH_INT) to GPIO10 (TOUCH_WAKE_PIN) — GPIO47 is not RTC-capable — **and** uncommenting the `TOUCH_WAKE_PIN` line in `power_mgr.cpp`'s `sleepFor()` (it ships commented out). Without both, only the button can wake from deep sleep.
+- The demo environment is the photograph/manual-test build: simulated clock (9:42 AM start, long-press button = +2h jump), boot-time connection-screen animation, plus touch diagnostics (heartbeat, init-failure logging) and 26 hardcoded test events covering edge cases (overlaps, gaps, all-day, cross-midnight, long titles).
+- Partial refresh comes in two flavors, and the split is a hardware constraint: the raw epdiy driver assumes the panel is **white** when it draws (`BLACK_ON_WHITE` mode, no previous-frame tracking) — it can drive pixels toward black/gray, but a **white target produces no drive at all**, so old dark pixels can never be silently erased. **Cleared partial refresh** (daily↔detail, settings modal, connection-screen band): `epd_clear_area` physically inverts the region dark-then-white before drawing — the brief flash *is* the erase; it's the only way to black→white on this driver. **Ghost refresh** (`ghostRefresh`): pushes rows with no clear — fast and flash-free, but it can only *add* ink; previously-drawn content stays at full strength until some later full/cleared refresh (used for the timeline-scroll experiment). Real silent partial updates need a controller with factory waveforms and previous-frame memory (what a Kindle has); this panel is dumb glass driven by bit-banged generic LUTs.
