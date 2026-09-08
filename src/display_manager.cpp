@@ -2,7 +2,6 @@
 #include "config.h"
 #include <Arduino.h>
 #include <cstring>
-#include "firasans.h"
 
 uint8_t *g_framebuffer = nullptr;
 
@@ -94,11 +93,39 @@ void partialRefresh(int x, int y, int w, int h) {
   free(temp);
 }
 
-void drawSplash(const char* msg) {
-  memset(g_framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
-  int32_t cx = EPD_WIDTH / 2 - 100;
-  int32_t cy = EPD_HEIGHT / 2;
-  writeln((GFXfont *)&FiraSans, msg, &cx, &cy, g_framebuffer);
+void ghostRefresh(int x, int y, int w, int h) {
+  // Same row-copy strategy as partialRefresh (full-width lines to dodge
+  // the driver's white-padding fast path), but WITHOUT epd_clear_area.
+  // Fast and flicker-free — but it can only ADD ink: the raw driver
+  // assumes the panel is white when drawing, so pixels whose target is
+  // white receive no drive at all and old content stays at full
+  // strength. Intended for transitional UI (timeline scroll) where a
+  // later full refresh resets the panel.
+  int fullLineBytes = EPD_WIDTH / 2;
+  int bufSize = fullLineBytes * h;
+  uint8_t* temp = (uint8_t*)ps_malloc(bufSize);
+  if (!temp) {
+    fullRefresh();
+    return;
+  }
+
+  for (int row = 0; row < h; row++) {
+    memcpy(temp + row * fullLineBytes,
+           g_framebuffer + (y + row) * fullLineBytes,
+           fullLineBytes);
+  }
+
+  Rect_t drawArea;
+  drawArea.x = 0;
+  drawArea.y = y;
+  drawArea.width = EPD_WIDTH;
+  drawArea.height = h;
+
+  epd_poweron();
+  epd_draw_grayscale_image(drawArea, temp);
+  epd_poweroff();
+
+  free(temp);
 }
 
 uint8_t* framebuffer() { return g_framebuffer; }

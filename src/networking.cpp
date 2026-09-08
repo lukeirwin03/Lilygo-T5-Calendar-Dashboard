@@ -29,6 +29,14 @@ RTC_DATA_ATTR static uint32_t lastHistoryChecksum = 0;
 
 // -- Helpers ------------------------------------------------------------------
 
+// Progress listener (see setProgressListener). Optional; nullptr = silent.
+static ProgressFn s_progressFn = nullptr;
+static void*      s_progressCtx = nullptr;
+
+static void notify(ProgressStage stage, ProgressEvent event) {
+  if (s_progressFn) s_progressFn(s_progressCtx, stage, event);
+}
+
 static const char* mqttStateName(int state) {
   switch (state) {
     case -4: return "CONNECTION_TIMEOUT";
@@ -151,6 +159,11 @@ static void onMessage(char* topic, byte* payload, unsigned int length) {
 
 // -- Public API ---------------------------------------------------------------
 
+void setProgressListener(ProgressFn fn, void* ctx) {
+  s_progressFn = fn;
+  s_progressCtx = ctx;
+}
+
 // Dispatch a raw JSON payload to the first dashboard. Used for live MQTT
 // messages, RTC-RAM replay, and SD-cache replay.
 bool dispatchPayload(const char* payload, size_t length) {
@@ -167,6 +180,7 @@ bool dispatchPayload(const char* payload, size_t length) {
 
 void connectWiFi() {
   Serial.printf("[wifi] Connecting to %s...\n", config::WIFI_SSID);
+  notify(PROG_WIFI, PROG_STARTED);
   WiFi.mode(WIFI_STA);
   WiFi.setTxPower(WIFI_POWER_17dBm);  // reduce peak TX current (~50-100 mA savings)
   WiFi.begin(config::WIFI_SSID, config::WIFI_PASSWORD);
@@ -178,6 +192,7 @@ void connectWiFi() {
     while (WiFi.status() != WL_CONNECTED) {
       delay(250);
       Serial.print(".");
+      notify(PROG_WIFI, PROG_WAITING);
       if (millis() - start > 15000) break;
     }
     if (WiFi.status() != WL_CONNECTED) {
@@ -192,8 +207,10 @@ void connectWiFi() {
   Serial.println();
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[wifi] FAILED to connect");
+    notify(PROG_WIFI, PROG_DONE_FAIL);
     return;
   }
+  notify(PROG_WIFI, PROG_DONE_OK);
   Serial.println("[wifi] Connected");
   Serial.printf("  SSID:    %s\n", WiFi.SSID().c_str());
   Serial.printf("  IP:      %s\n", WiFi.localIP().toString().c_str());
@@ -229,14 +246,18 @@ bool waitForTimeSync(unsigned long timeoutMs) {
   }
 
   Serial.printf("[time] Waiting for SNTP sync (up to %lu ms)...\n", timeoutMs);
+  notify(PROG_TIME, PROG_STARTED);
   const unsigned long start = millis();
   while ((now = time(nullptr)) < MIN_REASONABLE_EPOCH) {
     if (millis() - start > timeoutMs) {
       Serial.println("[time] SNTP sync TIMEOUT — wake alignment will drift");
+      notify(PROG_TIME, PROG_DONE_FAIL);
       return false;
     }
     delay(200);
+    notify(PROG_TIME, PROG_WAITING);
   }
+  notify(PROG_TIME, PROG_DONE_OK);
 
   struct tm lt;
   localtime_r(&now, &lt);
@@ -252,6 +273,7 @@ void connectMqtt() {
   mqtt.setCallback(onMessage);
   mqtt.setBufferSize(4096);
   mqtt.setKeepAlive(30);
+  notify(PROG_MQTT, PROG_STARTED);
 
   Serial.printf("[mqtt] Setup complete. Server=%s:%d, ClientID=%s\n",
                 config::MQTT_HOST, config::MQTT_PORT, config::MQTT_CLIENT_ID);
@@ -261,6 +283,7 @@ void connectMqtt() {
   while (!mqtt.connected() && attempts < MAX_MQTT_ATTEMPTS) {
     Serial.printf("[mqtt] Connecting to %s:%d as %s...\n",
                   config::MQTT_HOST, config::MQTT_PORT, config::MQTT_CLIENT_ID);
+    notify(PROG_MQTT, PROG_WAITING);
 
     bool ok;
     if (config::MQTT_USER && config::MQTT_USER[0] != '\0') {
@@ -273,6 +296,7 @@ void connectMqtt() {
 
     if (ok) {
       Serial.println("[mqtt] Connected successfully!");
+      notify(PROG_MQTT, PROG_DONE_OK);
       for (size_t i = 0; i < NUM_DASHBOARDS; i++) {
         const char* topic = dashboards[i]->topic();
         bool subOk = mqtt.subscribe(topic);
@@ -289,11 +313,13 @@ void connectMqtt() {
   }
   if (!mqtt.connected()) {
     Serial.println("[mqtt] FAILED to connect — proceeding without fresh data");
+    notify(PROG_MQTT, PROG_DONE_FAIL);
   }
 }
 
 bool pumpForPayload(unsigned long timeoutMs) {
   Serial.printf("[mqtt] Pumping for payload (timeout=%lu ms)...\n", timeoutMs);
+  notify(PROG_DATA, PROG_STARTED);
   const unsigned long start = millis();
   while (millis() - start < timeoutMs) {
     mqtt.loop();
@@ -304,12 +330,15 @@ bool pumpForPayload(unsigned long timeoutMs) {
       if (dashboards[i]->hasData) {
         Serial.printf("[mqtt] Dashboard '%s' has data after %lu ms\n",
                       dashboards[i]->name(), millis() - start);
+        notify(PROG_DATA, PROG_DONE_OK);
         return true;
       }
     }
     delay(20);
+    notify(PROG_DATA, PROG_WAITING);
   }
   Serial.printf("[mqtt] Timeout after %lu ms — no payload received\n", millis() - start);
+  notify(PROG_DATA, PROG_DONE_FAIL);
   return false;
 }
 
@@ -334,6 +363,7 @@ bool pumpForFreshPayload(unsigned long timeoutMs) {
   Serial.printf("[mqtt] Pumping for fresh payload (timeout=%lu ms)...\n", timeoutMs);
   // Reset dirty flags so we only detect messages arriving during this call.
   for (size_t i = 0; i < NUM_DASHBOARDS; i++) dashboards[i]->dirty = false;
+  notify(PROG_DATA, PROG_STARTED);
 
   const unsigned long start = millis();
   while (millis() - start < timeoutMs) {
@@ -341,12 +371,15 @@ bool pumpForFreshPayload(unsigned long timeoutMs) {
     for (size_t i = 0; i < NUM_DASHBOARDS; i++) {
       if (dashboards[i]->dirty) {
         Serial.printf("[mqtt] Fresh payload after %lu ms\n", millis() - start);
+        notify(PROG_DATA, PROG_DONE_OK);
         return true;
       }
     }
     delay(20);
+    notify(PROG_DATA, PROG_WAITING);
   }
   Serial.printf("[mqtt] No fresh payload after %lu ms\n", timeoutMs);
+  notify(PROG_DATA, PROG_DONE_FAIL);
   return false;
 }
 

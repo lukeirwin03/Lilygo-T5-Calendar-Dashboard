@@ -1,6 +1,22 @@
 #pragma once
 
 namespace networking {
+
+  // Optional progress observer for the connection sequence. When set,
+  // the blocking connect/pump calls below report coarse stage
+  // transitions so a UI (e.g. the cold-boot connection screen) can show
+  // live progress. The pointer is never stored beyond the call and must
+  // remain valid until cleared; pass nullptr to disable.
+  enum ProgressStage { PROG_WIFI, PROG_TIME, PROG_MQTT, PROG_DATA };
+  enum ProgressEvent {
+    PROG_STARTED,    // the stage began
+    PROG_WAITING,    // still blocked inside the stage (throttle as needed)
+    PROG_DONE_OK,    // the stage completed successfully
+    PROG_DONE_FAIL,  // the stage failed (sequence may stop early)
+  };
+  typedef void (*ProgressFn)(void* ctx, ProgressStage stage, ProgressEvent event);
+  void setProgressListener(ProgressFn fn, void* ctx = nullptr);
+
   void connectWiFi();
   void connectMqtt();
   void loop();              // call mqtt.loop() — keep connection alive

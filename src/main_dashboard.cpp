@@ -6,6 +6,7 @@
 #include "dashboards/calendar_dashboard.h"
 #include "ui.h"
 #include "networking.h"
+#include "conn_screen.h"
 #include "power_mgr.h"
 #include "touch_input.h"
 #include "battery.h"
@@ -114,6 +115,12 @@ static bool doRender() {
       ui::getSettingsDirtyRect(sx, sy, sw, sh);
       display_mgr::partialRefresh(sx, sy, sw, sh);
       Serial.println("[render] Partial refresh (settings)");
+    } else if (mode == 3) {  // REFRESH_PARTIAL_FOCUS (timeline scroll, ghost)
+      ui::render();
+      int fx, fy, fw, fh;
+      ui::getFocusGhostRect(fx, fy, fw, fh);
+      display_mgr::ghostRefresh(fx, fy, fw, fh);
+      Serial.println("[render] Ghost refresh (focus timeline)");
     } else {
       display_mgr::powerOn();
       epd_clear();
@@ -175,6 +182,19 @@ static unsigned long msUntilWindowStart(time_t now, const struct tm& lt) {
   long diffSec = (long)difftime(targetEpoch, now);
   if (diffSec < 0) diffSec += 24 * 3600;  // window start already passed; it's tomorrow
   return (unsigned long)diffSec * 1000UL;
+}
+
+// Bridge networking's progress events to the connection screen. The
+// numeric stages line up with conn_screen's stage indices (see
+// conn_screen.h).
+static void connProgressCb(void* /*ctx*/, networking::ProgressStage stage,
+                           networking::ProgressEvent event) {
+  switch (event) {
+    case networking::PROG_STARTED:   conn_screen::stageStart((int)stage); break;
+    case networking::PROG_WAITING:   conn_screen::tick();                 break;
+    case networking::PROG_DONE_OK:   conn_screen::stageDone((int)stage, true);  break;
+    case networking::PROG_DONE_FAIL: conn_screen::stageDone((int)stage, false); break;
+  }
 }
 
 // Connect WiFi/MQTT, pull the latest retained payload, disconnect.
@@ -298,18 +318,21 @@ void setup() {
       Serial.println("[boot] Rendered from SD cache");
     }
 
+    bool gotFreshData = false;
     if (!renderedFromCache) {
-      // No usable cache or clock not set yet — show splash while connecting.
-      display_mgr::drawSplash("Connecting...");
-      display_mgr::powerOn();
-      display_mgr::fullRefresh();
-      display_mgr::powerOff();
+      // No usable cache or clock not set yet — show the connection
+      // screen with live partial-update progress, then connect. The
+      // listener is scoped to this call so later refreshes (Sync button,
+      // wakes with a view already on screen) never clobber the display.
+      conn_screen::begin();
+      networking::setProgressListener(connProgressCb);
+      gotFreshData = backgroundRefresh(false);
+      networking::setProgressListener(nullptr);
+    } else {
+      // Cache already on screen: only genuinely new data triggers a
+      // re-render (freshOnly=true).
+      gotFreshData = backgroundRefresh(true);
     }
-
-    // --- WiFi / NTP / MQTT refresh ---
-    // If we already rendered from cache, only genuinely new data triggers a
-    // re-render (freshOnly=true); otherwise any data will do.
-    bool gotFreshData = backgroundRefresh(renderedFromCache);
 
     // If still no data (MQTT failed), fall back to caches (no WiFi needed).
     if (!calendarDash.hasData) {
