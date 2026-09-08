@@ -25,6 +25,14 @@ namespace networking {
   bool isMqttConnected();
   int  getRssi();   // WiFi RSSI in dBm, or 0 if WiFi is down
 
+  // Outcome of the most recent connection attempt, for the Diagnostics
+  // tab. Kept in RTC memory, so it survives deep sleep — a later wake can
+  // report the previous attempt. ATTEMPT_NONE until the first attempt
+  // after power-on.
+  enum AttemptStatus { ATTEMPT_NONE, ATTEMPT_FAILED, ATTEMPT_OK };
+  AttemptStatus lastWifiStatus();
+  AttemptStatus lastMqttStatus();
+
   // Blocks up to timeoutMs waiting for SNTP to set the system clock.
   // Returns true once time(nullptr) reflects a real epoch (either it
   // was already synced from a prior boot's RTC value, or SNTP completed

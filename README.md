@@ -90,7 +90,7 @@ Tap the physical button to open the **Settings modal** (tap the button again, or
 - A **battery readout** in the title bar (glyph + percentage)
 - A **Display** tab — Day Start, Day End, Time Format (12h/24h), Context Days (days of context shown each side of today, 1–7)
 - A **Power** tab — Refresh Every, Sleep After, Sleep Starts, Sleep Ends, Keep History
-- A **Diagnostics** tab — Last Updated (age of the displayed payload, from its `updated` field), WiFi (on/off + RSSI), MQTT (connected/off), Battery, free Memory
+- A **Diagnostics** tab — Last Updated (age of the displayed payload, from its `updated` field), WiFi and MQTT (live state on the rare occasion the radio is actually up — normally the outcome of the most recent connection attempt, e.g. "Last: OK" / "Last: fail", kept in RTC memory so it survives deep sleep), Battery, free Memory
 - **− / +** buttons cycle the selected row's value; **Save** persists all values to the SD card and closes the modal
 - A **Sync** button next to **Save** — forces a fresh MQTT pull (the modal closes; the display re-renders when fresh data lands, ~10–30 s later) (dashboard env only — the demo build has no networking)
 

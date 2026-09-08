@@ -26,6 +26,11 @@ RTC_DATA_ATTR static size_t rtcPayloadLen = 0;
 // Checksum of the last payload appended to history — survives deep sleep
 // so we can dedup across wakes.
 RTC_DATA_ATTR static uint32_t lastHistoryChecksum = 0;
+// Outcome of the most recent WiFi/MQTT connection attempt — survives deep
+// sleep so the Diagnostics tab can report the previous attempt. Zero-
+// initialized on power-on = ATTEMPT_NONE.
+RTC_DATA_ATTR static int s_lastWifiStatus = 0;
+RTC_DATA_ATTR static int s_lastMqttStatus = 0;
 
 // -- Helpers ------------------------------------------------------------------
 
@@ -207,9 +212,11 @@ void connectWiFi() {
   Serial.println();
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[wifi] FAILED to connect");
+    s_lastWifiStatus = ATTEMPT_FAILED;
     notify(PROG_WIFI, PROG_DONE_FAIL);
     return;
   }
+  s_lastWifiStatus = ATTEMPT_OK;
   notify(PROG_WIFI, PROG_DONE_OK);
   Serial.println("[wifi] Connected");
   Serial.printf("  SSID:    %s\n", WiFi.SSID().c_str());
@@ -296,6 +303,7 @@ void connectMqtt() {
 
     if (ok) {
       Serial.println("[mqtt] Connected successfully!");
+      s_lastMqttStatus = ATTEMPT_OK;
       notify(PROG_MQTT, PROG_DONE_OK);
       for (size_t i = 0; i < NUM_DASHBOARDS; i++) {
         const char* topic = dashboards[i]->topic();
@@ -313,6 +321,7 @@ void connectMqtt() {
   }
   if (!mqtt.connected()) {
     Serial.println("[mqtt] FAILED to connect — proceeding without fresh data");
+    s_lastMqttStatus = ATTEMPT_FAILED;
     notify(PROG_MQTT, PROG_DONE_FAIL);
   }
 }
@@ -407,5 +416,7 @@ void loop() {
 bool isWiFiConnected() { return WiFi.status() == WL_CONNECTED; }
 bool isMqttConnected() { return mqtt.connected(); }
 int  getRssi()         { return isWiFiConnected() ? (int)WiFi.RSSI() : 0; }
+AttemptStatus lastWifiStatus() { return (AttemptStatus)s_lastWifiStatus; }
+AttemptStatus lastMqttStatus() { return (AttemptStatus)s_lastMqttStatus; }
 
 } // namespace networking

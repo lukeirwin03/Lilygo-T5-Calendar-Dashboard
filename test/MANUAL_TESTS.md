@@ -82,7 +82,7 @@ Run these on the actual device after flashing.
 - [ ] Tabs: Display, Power, Diagnostics
 - [ ] Tap a setting row → highlights it
 - [ ] Tap − or + → cycles the selected value (row updates via partial refresh)
-- [ ] Diagnostics tab shows Last Updated age, WiFi RSSI, MQTT state, battery, free memory
+- [ ] Diagnostics tab shows Last Updated age, WiFi/MQTT last-attempt outcome ("Last: OK" / "Last: fail" after a refresh; "Off" before the first attempt after power-on; live "On −xxdBm" only if opened mid-connection), battery, free memory
 - [ ] Tap Save → writes `/config/settings.json` to SD card and closes the modal
 - [ ] Tap Sync → closes the modal and forces a fresh MQTT pull (calendar re-renders when data lands)
 - [ ] Tap Close (or button) → returns to the previous view (full refresh)

@@ -44,15 +44,36 @@ static constexpr uint8_t EPD_LTGRAY = C_LTGRAY << 4;
 static constexpr uint8_t EPD_WHITE  = C_WHITE  << 4;
 
 // The demo env excludes networking.cpp from the build (see platformio.ini).
-// The Diagnostics rows fall back to static "off" values there.
 #ifdef ENV_DEMO
-static bool demoWifiConnected() { return false; }
-static int  demoWifiRssi()      { return 0; }
-static bool demoMqttConnected() { return false; }
+// No radio in the demo build — there are no refresh attempts to report.
+static void wifiDiagStr(char* buf, size_t len) { snprintf(buf, len, "No radio"); }
+static void mqttDiagStr(char* buf, size_t len) { snprintf(buf, len, "No radio"); }
 #else
-static bool demoWifiConnected() { return networking::isWiFiConnected(); }
-static int  demoWifiRssi()      { return networking::getRssi(); }
-static bool demoMqttConnected() { return networking::isMqttConnected(); }
+// Live radio state when connected (almost never while this modal is open —
+// WiFi drops the moment the payload arrives), otherwise the outcome of the
+// most recent connection attempt, which survives deep sleep.
+static void wifiDiagStr(char* buf, size_t len) {
+  if (networking::isWiFiConnected()) {
+    snprintf(buf, len, "On %ddBm", networking::getRssi());
+    return;
+  }
+  switch (networking::lastWifiStatus()) {
+    case networking::ATTEMPT_OK:     snprintf(buf, len, "Last: OK");   break;
+    case networking::ATTEMPT_FAILED: snprintf(buf, len, "Last: fail"); break;
+    default:                         snprintf(buf, len, "Off");        break;
+  }
+}
+static void mqttDiagStr(char* buf, size_t len) {
+  if (networking::isMqttConnected()) {
+    snprintf(buf, len, "Connected");
+    return;
+  }
+  switch (networking::lastMqttStatus()) {
+    case networking::ATTEMPT_OK:     snprintf(buf, len, "Last: OK");   break;
+    case networking::ATTEMPT_FAILED: snprintf(buf, len, "Last: fail"); break;
+    default:                         snprintf(buf, len, "Off");        break;
+  }
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -202,16 +223,11 @@ static void getValueStr(SettingId id, char* buf, size_t len) {
       snprintf(buf, len, "%s (%s)", ts, ageStr);
       break;
     }
-    case SET_DIAG_WIFI: {
-      if (demoWifiConnected()) {
-        snprintf(buf, len, "On %ddBm", demoWifiRssi());
-      } else {
-        snprintf(buf, len, "Off");
-      }
+    case SET_DIAG_WIFI:
+      wifiDiagStr(buf, len);
       break;
-    }
     case SET_DIAG_MQTT:
-      snprintf(buf, len, "%s", demoMqttConnected() ? "Connected" : "Off");
+      mqttDiagStr(buf, len);
       break;
     case SET_DIAG_BATTERY: {
       int p = battery::lastPercent();
