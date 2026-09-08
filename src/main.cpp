@@ -1,6 +1,8 @@
 #include <Arduino.h>
+#include <sys/time.h>
 #include "config.h"
 #include "display_manager.h"
+#include "conn_screen.h"
 #include "ui.h"
 #include "battery.h"
 #include "touch_input.h"
@@ -15,6 +17,86 @@ static unsigned long lastActivityMs = 0;
 
 static CalendarEvent testEvents[28];
 static const int TEST_EVENT_COUNT = 26;
+
+// Simulated clock: starts at 9:42 AM on the real boot date and then runs
+// in real time, giving the demo a valid "today" so the sliding timeline
+// window, now marker, and scroll arrows are all live. Long-press the
+// button to jump +2h (wrapping past midnight back to 6 AM) and watch the
+// window slide/freeze across the day.
+static constexpr int DEMO_START_HOUR = 9;
+static constexpr int DEMO_START_MIN  = 42;
+
+static void initSimClock() {
+  setenv("TZ", config::TIMEZONE, 1);
+  tzset();
+  time_t boot = time(nullptr);
+  struct tm simTm;
+  localtime_r(&boot, &simTm);
+  simTm.tm_hour = DEMO_START_HOUR;
+  simTm.tm_min  = DEMO_START_MIN;
+  simTm.tm_sec  = 0;
+  timeval tv;
+  tv.tv_sec = mktime(&simTm);
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+}
+
+static void logSimClock() {
+  time_t t = time(nullptr);
+  struct tm lt;
+  localtime_r(&t, &lt);
+  Serial.printf("[demo] Simulated clock: %04d-%02d-%02d %02d:%02d:%02d "
+                "(long-press button to jump +2h)\n",
+                lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+                lt.tm_hour, lt.tm_min, lt.tm_sec);
+}
+
+// Jump the simulated clock forward by `hours`, wrapping within the same
+// demo day (past midnight → back to 6 AM) so the boot-day events stay
+// valid. Re-feeds the events so a fresh render runs (also resets any
+// manual timeline scroll).
+static void demoJumpTime(int hours) {
+  time_t t = time(nullptr);
+  struct tm lt;
+  localtime_r(&t, &lt);
+  int newHour = lt.tm_hour + hours;
+  if (newHour >= 24) newHour -= 18;   // wrap to morning of the same day
+  lt.tm_hour = newHour;
+  lt.tm_min = 0;
+  lt.tm_sec = 0;
+  timeval tv;
+  tv.tv_sec = mktime(&lt);
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  logSimClock();
+  ui::setEvents(testEvents, TEST_EVENT_COUNT);   // pending render + scroll reset
+}
+
+// Delay that any touch or button press breaks early — used to let the
+// connection animation be skipped.
+static void demoDelay(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (touch_input::isTouched() || digitalRead(config::BUTTON_PIN) == LOW) return;
+    delay(20);
+  }
+}
+
+// Play the cold-boot connection screen so it can be photographed on the
+// demo build (dashboard env only shows it on a true no-cache cold boot).
+// Each band update is a cleared partial refresh (~1-2 s), so the stages
+// are paced for that; all four succeed.
+static void demoConnectionAnimation() {
+  Serial.println("[demo] Connection screen (touch/button skips)...");
+  conn_screen::begin();
+  for (int s = 0; s < 4; s++) {
+    conn_screen::stageStart(s);
+    demoDelay(900);
+    conn_screen::stageDone(s, true);
+    demoDelay(400);
+  }
+  demoDelay(1500);   // hold the completed bar for photos
+}
 
 static void initTestEvents() {
   time_t now = time(nullptr);
@@ -135,6 +217,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   setCpuFrequencyMhz(160);  // save ~30% active power vs default 240 MHz
+  initSimClock();
   logBootInfo();
 
   if (!display_mgr::begin()) {
@@ -150,6 +233,9 @@ void setup() {
   }
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
+
+  // Photogenic boot: play the connection screen animation (skippable).
+  demoConnectionAnimation();
 
   sd_storage::begin();
   settings::init();
@@ -174,6 +260,12 @@ static void doRender() {
     ui::getSettingsDirtyRect(sx, sy, sw, sh);
     display_mgr::partialRefresh(sx, sy, sw, sh);
     Serial.println("[demo] Partial refresh (settings)");
+  } else if (mode == 3) {  // REFRESH_PARTIAL_FOCUS (timeline scroll, ghost)
+    ui::render();
+    int fx, fy, fw, fh;
+    ui::getFocusGhostRect(fx, fy, fw, fh);
+    display_mgr::ghostRefresh(fx, fy, fw, fh);
+    Serial.println("[demo] Ghost refresh (focus timeline)");
   } else {
     display_mgr::powerOn();
     epd_clear();
@@ -192,20 +284,45 @@ static void enterSleep(const char* reason) {
   power_mgr::sleepFor(sleepMs);  // never returns
 }
 
-void loop() {
-  unsigned long now = millis();
+// Button: short press toggles the settings modal; long press (≥800 ms)
+// jumps the simulated clock +2h so the sliding-window states (morning
+// clamp, mid-day slide, freeze, evening ▼ clamp) can be photographed.
+static bool s_btnDown = false;
+static unsigned long s_btnDownMs = 0;
+static bool s_btnLongFired = false;
+static constexpr unsigned long BTN_LONG_PRESS_MS = 800;
 
-  handleTouch();
+static void handleDemoButton(unsigned long now) {
+  bool pressed = digitalRead(config::BUTTON_PIN) == LOW;
 
-  // Button toggles the settings modal (active low, debounced)
-  if (digitalRead(config::BUTTON_PIN) == LOW) {
-    if (now - lastButtonMs > 300) {
+  if (pressed && !s_btnDown) {
+    s_btnDown = true;
+    s_btnDownMs = now;
+    s_btnLongFired = false;
+  }
+  if (pressed && s_btnDown && !s_btnLongFired
+      && now - s_btnDownMs >= BTN_LONG_PRESS_MS) {
+    s_btnLongFired = true;
+    lastActivityMs = now;
+    demoJumpTime(2);
+  }
+  if (!pressed && s_btnDown) {
+    s_btnDown = false;
+    if (!s_btnLongFired && now - s_btnDownMs < BTN_LONG_PRESS_MS
+        && now - lastButtonMs > 300) {
       lastButtonMs = now;
       lastActivityMs = now;
       ui::toggleSettings();
       Serial.println("[demo] Button -> toggle settings");
     }
   }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  handleTouch();
+  handleDemoButton(now);
 
   // Render once if the UI has pending changes (from a touch gesture or button).
   // This consumes the UI pending flag exactly once, after all input is processed.
