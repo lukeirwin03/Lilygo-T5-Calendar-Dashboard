@@ -449,6 +449,150 @@ void test_blockheight_long_cap_plateau(void) {
   TEST_ASSERT_EQUAL(112, computeBlockHeight(600, 338, 1440, 40));
 }
 
+// ---------------------------------------------------------------------------
+// Focus-column timeline windows — mirrors computeTodayWindow() and
+// computeStaticWindow() in src/ui.cpp. Times are minutes-of-day; "sparse"
+// is the reference scenario: a single 2:00-3:00 PM event, Day Start 7 AM.
+// ---------------------------------------------------------------------------
+static int imax2(int a, int b) { return (a > b) ? a : b; }
+static int imin2(int a, int b) { return (a < b) ? a : b; }
+static int roundDownHalf(int m) { return (m / 30) * 30; }
+static int roundUpHour(int m) { return ((m + 59) / 60) * 60; }
+
+struct FW { int start; int end; };
+
+static FW computeTodayWindow(int earliestStart, int lastEnd,
+                             int lastUpcomingEnd, int nowMin, int dayStartHour) {
+  const int MIN_DUR = 6 * 60;
+  const int CEIL    = 28 * 60;
+  int anchor   = imax2(4 * 60, dayStartHour * 60);
+  int slideCap = imax2(anchor, lastEnd - 60);
+  int start    = anchor;
+  if (nowMin - 60 > anchor) {
+    int slid = roundDownHalf(nowMin - 60);
+    if (slid > slideCap) slid = slideCap;
+    if (slid > start) start = slid;
+  }
+  int baseEnd = (lastUpcomingEnd > 0 ? lastUpcomingEnd : lastEnd) + 60;
+  int end = roundUpHour(baseEnd);
+  if (end < start + MIN_DUR) end = start + MIN_DUR;
+  if (end > CEIL) {
+    end = CEIL;
+    if (end - start < MIN_DUR) start = imax2(4 * 60, end - MIN_DUR);
+  }
+  return { start, end };
+}
+
+static FW computeStaticWindow(int earliestStart, int lastEnd) {
+  const int CEIL = 28 * 60;
+  int start = imax2(4 * 60, earliestStart - 60);
+  int paddedEnd = imin2(CEIL, lastEnd + 60);
+  int duration = paddedEnd - start;
+  const int nice[] = { 6*60, 9*60, 12*60, 18*60, 24*60 };
+  int niceDur = 24 * 60;
+  for (int i = 0; i < 5; i++) {
+    if (nice[i] >= duration) { niceDur = nice[i]; break; }
+  }
+  int end = start + niceDur;
+  if (end > CEIL) {
+    end = CEIL;
+    start = end - niceDur;
+    if (start < 4 * 60) { start = 4 * 60; end = start + niceDur; }
+  }
+  return { start, end };
+}
+
+// Sparse reference scenario: one 14:00-15:00 event, Day Start 7 AM.
+void test_window_sparse_morning(void) {
+  // 9:00 AM render: slide anchor 8:00; event upcoming → end 15:00+1h = 16:00.
+  FW w = computeTodayWindow(840, 900, 900, 9 * 60, 7);
+  TEST_ASSERT_EQUAL(8 * 60, w.start);    // 8:00 AM
+  TEST_ASSERT_EQUAL(16 * 60, w.end);     // 4:00 PM
+}
+
+void test_window_sparse_midday(void) {
+  // 1:00 PM render: slide anchor noon; 4h window < 6h → end extends to 6 PM.
+  FW w = computeTodayWindow(840, 900, 900, 13 * 60, 7);
+  TEST_ASSERT_EQUAL(12 * 60, w.start);
+  TEST_ASSERT_EQUAL(18 * 60, w.end);
+}
+
+void test_window_sparse_freezes_at_last_event(void) {
+  // 4:00 PM (event over): start frozen at lastEnd-1h = 2 PM; end = max(4 PM, start+6h) = 8 PM.
+  FW w = computeTodayWindow(840, 900, -1, 16 * 60, 7);
+  TEST_ASSERT_EQUAL(14 * 60, w.start);
+  TEST_ASSERT_EQUAL(20 * 60, w.end);
+  // 9:00 PM: window unchanged (frozen); the now marker clamps ▼ past 8 PM.
+  FW w2 = computeTodayWindow(840, 900, -1, 21 * 60, 7);
+  TEST_ASSERT_EQUAL(14 * 60, w2.start);
+  TEST_ASSERT_EQUAL(20 * 60, w2.end);
+}
+
+void test_window_early_morning_no_slide(void) {
+  // 6:00 AM: now-1h = 5 AM ≤ Day Start anchor → no slide, marker clamps ▲.
+  FW w = computeTodayWindow(840, 900, 900, 6 * 60, 7);
+  TEST_ASSERT_EQUAL(7 * 60, w.start);
+  TEST_ASSERT_EQUAL(16 * 60, w.end);
+}
+
+void test_window_slide_rounds_down_half_hour(void) {
+  // 9:45 AM: now-1h = 8:45 → rounds down to 8:30.
+  FW w = computeTodayWindow(840, 900, 900, 9 * 60 + 45, 7);
+  TEST_ASSERT_EQUAL(8 * 60 + 30, w.start);
+}
+
+void test_window_end_rounds_up_hour(void) {
+  // Event 14:00-15:20 → baseEnd 16:20 → rounds up to 17:00.
+  FW w = computeTodayWindow(840, 920, 920, 9 * 60, 7);
+  TEST_ASSERT_EQUAL(17 * 60, w.end);
+}
+
+void test_window_dense_future_stays_visible(void) {
+  // Events 9:00-9:30 and 14:00-15:00; 11:00 AM render. Slide to 10 AM but
+  // the end must still cover the 2 PM event (+1h, snapped up).
+  FW w = computeTodayWindow(540, 900, 900, 11 * 60, 7);
+  TEST_ASSERT_EQUAL(10 * 60, w.start);
+  TEST_ASSERT_EQUAL(16 * 60, w.end);
+}
+
+void test_window_events_before_day_start(void) {
+  // Only event 5:00-6:00 AM, viewing at 2 PM: slideCap (5 AM) < anchor, so
+  // start stays at Day Start; end = max(7 AM, start+6h).
+  FW w = computeTodayWindow(300, 360, -1, 14 * 60, 7);
+  TEST_ASSERT_EQUAL(7 * 60, w.start);
+  TEST_ASSERT_EQUAL(13 * 60, w.end);
+}
+
+void test_window_today_ceiling(void) {
+  // Event 20:00-24:00, now 23:00: slide to 22:00; end wants 25:00 but the
+  // 6h floor pushes it to the 4 AM ceiling.
+  FW w = computeTodayWindow(1200, 1440, 1440, 23 * 60, 7);
+  TEST_ASSERT_EQUAL(22 * 60, w.start);
+  TEST_ASSERT_EQUAL(28 * 60, w.end);
+}
+
+void test_window_static_6h_floor(void) {
+  // Non-today single 30-min 2 PM event: 1 PM + 6h (nice-snap floor).
+  FW w = computeStaticWindow(840, 900);
+  TEST_ASSERT_EQUAL(13 * 60, w.start);
+  TEST_ASSERT_EQUAL(19 * 60, w.end);
+}
+
+void test_window_static_nice_snap(void) {
+  // Non-today 8 AM-5 PM event: 7 AM start, 10h → snaps to 12h.
+  FW w = computeStaticWindow(480, 1020);
+  TEST_ASSERT_EQUAL(7 * 60, w.start);
+  TEST_ASSERT_EQUAL(19 * 60, w.end);
+}
+
+void test_window_static_ceiling_shifts_start_back(void) {
+  // Non-today 23:30-27:00 event: start 22:30, dur 4.5h → 6h snap → end would
+  // pass 4 AM, so end clamps and start shifts back to 22:00.
+  FW w = computeStaticWindow(1410, 1620);
+  TEST_ASSERT_EQUAL(22 * 60, w.start);
+  TEST_ASSERT_EQUAL(28 * 60, w.end);
+}
+
 int main() {
   UNITY_BEGIN();
 
@@ -499,6 +643,20 @@ int main() {
   RUN_TEST(test_blockheight_sparse_keeps_text_floor);
   RUN_TEST(test_blockheight_long_uses_min_and_proportional);
   RUN_TEST(test_blockheight_long_cap_plateau);
+
+  // Focus-column timeline windows (sliding today window, static other days)
+  RUN_TEST(test_window_sparse_morning);
+  RUN_TEST(test_window_sparse_midday);
+  RUN_TEST(test_window_sparse_freezes_at_last_event);
+  RUN_TEST(test_window_early_morning_no_slide);
+  RUN_TEST(test_window_slide_rounds_down_half_hour);
+  RUN_TEST(test_window_end_rounds_up_hour);
+  RUN_TEST(test_window_dense_future_stays_visible);
+  RUN_TEST(test_window_events_before_day_start);
+  RUN_TEST(test_window_today_ceiling);
+  RUN_TEST(test_window_static_6h_floor);
+  RUN_TEST(test_window_static_nice_snap);
+  RUN_TEST(test_window_static_ceiling_shifts_start_back);
 
   UNITY_END();
   return 0;

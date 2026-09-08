@@ -86,9 +86,25 @@ static int s_dailyCount = 0;
 
 static bool       s_pendingRender = false;
 
-// Refresh mode: full or partial (settings/daily row update).
-enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS, REFRESH_PARTIAL_DAILY };
+// Refresh mode: full, or one of the partial variants. FOCUS is the
+// no-clear ("ghost") push of the focus column used by timeline scrolling —
+// fast, but prior frames leave faint ghosts until the next full refresh.
+enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS, REFRESH_PARTIAL_DAILY,
+                   REFRESH_PARTIAL_FOCUS };
 static RefreshMode s_refreshMode = REFRESH_FULL;
+
+// Focus-column (today only) sliding-window state. renderWeeklyView
+// publishes the rendered geometry here so classifyGesture can hit-test
+// the scroll arrows against exactly what is on screen.
+static bool s_focusGeomValid = false;   // true when today's focus window was rendered
+static int  s_focusColX = 0, s_focusColW = 0;
+static int  s_focusTop = 0, s_focusBot = 0;
+static int  s_focusWinStart = 0, s_focusWinEnd = 0;   // minutes-of-day
+static int  s_focusMinStart = 0;                      // earliest allowed window start
+static bool s_focusCanScrollUp = false, s_focusCanScrollDown = false;
+// Manual scroll-back offset in minutes (≤ 0). Applied on top of the
+// auto window; reset by new data, navigation, or settings changes.
+static int  s_focusScrollOffsetMin = 0;
 
 // Settings screen tracks the previous touch state so a single tap is handled
 // only on the rising edge of the touch signal.
@@ -157,12 +173,10 @@ static bool isTodayColumn(int colIdx) {
   return (s_baseDayOffset + (colIdx - 1)) == 0;
 }
 
-// Resolve the timeline bounds from the persisted user settings.
+// Resolve the timeline start bound from the persisted user settings
+// (the Day Start setting anchors today's sliding window).
 static int resolvedDayStartHour() {
   return settings::get().day_start_hour;
-}
-static int resolvedDayEndHour() {
-  return settings::get().day_end_hour;
 }
 
 // Format a struct tm as "YYYY-MM-DD"
@@ -819,6 +833,7 @@ static bool isInCooldown() {
 static void triggerNav(int days) {
   s_baseDayOffset = clampDayOffset(s_baseDayOffset + days);
   s_selectedEventIdx = -1;
+  s_focusScrollOffsetMin = 0;   // manual focus scroll doesn't survive navigation
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
@@ -827,6 +842,8 @@ static void triggerNav(int days) {
 static void triggerScreenChange(Screen next, int dayOffset) {
   s_screen = next;
   s_baseDayOffset = clampDayOffset(dayOffset);
+  s_selectedEventIdx = -1;
+  s_focusScrollOffsetMin = 0;
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
@@ -992,7 +1009,40 @@ static void classifyGesture() {
         triggerNav(+1);
         return;
       } else {
-        // col == 1, focus column = open daily view for the focus day
+        // col == 1, focus column
+
+        // Scroll arrows first — small visuals, generous hitboxes (116x64,
+        // anchored on the 24 px arrow glyph). Up = page back to scrolled-off
+        // past events; down = page forward toward the auto (now-following)
+        // window.
+        if (s_focusGeomValid) {
+          int step = (s_focusWinEnd - s_focusWinStart) - 60;
+          if (step < 60) step = 60;
+          int ax = s_focusColX + s_focusColW - 116;
+          if (s_focusCanScrollUp
+              && s_startX >= ax && s_startX <= ax + 116
+              && s_startY >= s_focusTop - 16 && s_startY <= s_focusTop + 48) {
+            s_focusScrollOffsetMin -= step;
+            s_pendingRender = true;
+            s_refreshMode = REFRESH_PARTIAL_FOCUS;   // ghost push of the timeline
+            s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
+            Serial.println("[ui] Focus scroll up (back in time)");
+            return;
+          }
+          if (s_focusCanScrollDown
+              && s_startX >= ax && s_startX <= ax + 116
+              && s_startY >= s_focusBot - 48 && s_startY <= s_focusBot + 16) {
+            s_focusScrollOffsetMin += step;
+            if (s_focusScrollOffsetMin > 0) s_focusScrollOffsetMin = 0;
+            s_pendingRender = true;
+            s_refreshMode = REFRESH_PARTIAL_FOCUS;
+            s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
+            Serial.println("[ui] Focus scroll down (toward now)");
+            return;
+          }
+        }
+
+        // Focus column tap → open daily view for the focus day
         s_selectedEventIdx = -1;
         triggerScreenChange(SCREEN_DAILY, s_baseDayOffset);
         return;
@@ -1102,6 +1152,21 @@ void getDailyDirtyRect(int& x, int& y, int& w, int& h) {
   h = listH + 4;    // 4px top only
 }
 
+// Row range covering everything a timeline scroll can change: the focus
+// column from just above the top boundary label to the bottom of the
+// screen. Used by the no-clear ghost refresh after scroll-arrow taps.
+// Falls back to the full screen if no focus geometry is published.
+void getFocusGhostRect(int& x, int& y, int& w, int& h) {
+  if (!s_focusGeomValid) {
+    x = 0; y = 0; w = EPD_WIDTH; h = EPD_HEIGHT;
+    return;
+  }
+  x = s_focusColX - 4;
+  w = s_focusColW + 8;
+  y = s_focusTop - 28;                        // include the top boundary label
+  h = (EPD_HEIGHT - 4) - y;                   // through the bottom label
+}
+
 // Lane assignment for an event in a column. `lane` is the index of the lane
 // the event occupies (0-based); `laneCount` is the total number of lanes
 // active during this event's lifetime (determines width).
@@ -1183,11 +1248,135 @@ static void computeLaneAssignments(const CalendarEvent* events,
 }
 
 // ---------------------------------------------------------------------------
+// Focus-column timeline window computation (pure — mirrored in
+// test/test_calendar for native unit tests)
+// ---------------------------------------------------------------------------
+static int imax_(int a, int b) { return (a > b) ? a : b; }
+static int imin_(int a, int b) { return (a < b) ? a : b; }
+
+// Round down to a half-hour boundary (8:45 → 8:30).
+static int roundDownHalf(int m) { return (m / 30) * 30; }
+
+// Round up to a whole-hour boundary (16:20 → 17:00).
+static int roundUpHour(int m) { return ((m + 59) / 60) * 60; }
+
+struct FocusWindow { int start; int end; };
+
+// Today's window (clock valid): anchored at Day Start, slides forward to
+// keep "now − 1h" at the top while the day progresses, and freezes at
+// lastEventEnd − 1h once the day's events are over — so the last event
+// stays pinned at the top of the window for the rest of the day. The end
+// extends past the last (upcoming) event end + 1h, rounded up to the
+// hour, with a 6h minimum duration and the 4 AM ceiling.
+static FocusWindow computeTodayWindow(int earliestStart, int lastEnd,
+                                      int lastUpcomingEnd, int nowMin,
+                                      int dayStartHour) {
+  const int MIN_DUR = 6 * 60;
+  const int CEIL    = 28 * 60;   // 4 AM next day
+  int anchor   = imax_(4 * 60, dayStartHour * 60);
+  int slideCap = imax_(anchor, lastEnd - 60);   // freeze point (never slide past this)
+  int start    = anchor;
+  if (nowMin - 60 > anchor) {
+    int slid = roundDownHalf(nowMin - 60);
+    if (slid > slideCap) slid = slideCap;
+    if (slid > start) start = slid;
+  }
+  int baseEnd = (lastUpcomingEnd > 0 ? lastUpcomingEnd : lastEnd) + 60;
+  int end = roundUpHour(baseEnd);
+  if (end < start + MIN_DUR) end = start + MIN_DUR;
+  if (end > CEIL) {
+    end = CEIL;
+    if (end - start < MIN_DUR) start = imax_(4 * 60, end - MIN_DUR);
+  }
+  return { start, end };
+}
+
+// Any other day (or unset clock): deterministic event-anchored window —
+// earliest − 1h to latest + 1h, snapped up to a nice duration (6h floor),
+// clamped to the 4 AM–4 AM range. Identical on every render so
+// navigating to the day always looks the same.
+static FocusWindow computeStaticWindow(int earliestStart, int lastEnd) {
+  const int CEIL = 28 * 60;
+  int start = imax_(4 * 60, earliestStart - 60);
+  int paddedEnd = imin_(CEIL, lastEnd + 60);
+  int duration = paddedEnd - start;
+  const int nice[] = { 6*60, 9*60, 12*60, 18*60, 24*60 };
+  int niceDur = 24 * 60;
+  for (int i = 0; i < 5; i++) {
+    if (nice[i] >= duration) { niceDur = nice[i]; break; }
+  }
+  int end = start + niceDur;
+  if (end > CEIL) {
+    end = CEIL;
+    start = end - niceDur;
+    if (start < 4 * 60) { start = 4 * 60; end = start + niceDur; }
+  }
+  return { start, end };
+}
+
+// Small chevron (14 px wide) — arrows aren't in the custom fonts, so
+// they're drawn with lines like drawArrowButton.
+static void drawChevron(int cx, int cy, bool up, uint8_t color, uint8_t* fb) {
+  if (up) {
+    epd_draw_line(cx - 7, cy + 6, cx, cy - 6, color, fb);
+    epd_draw_line(cx, cy - 6, cx + 7, cy + 6, color, fb);
+  } else {
+    epd_draw_line(cx - 7, cy - 6, cx, cy + 6, color, fb);
+    epd_draw_line(cx, cy + 6, cx + 7, cy - 6, color, fb);
+  }
+}
+
+// One '>' / '<' chevron of the "now" marker pair. `right` = apex points
+// right ('>'); the base trails 7 px behind it.
+static void drawNowChev(int apexX, int y, bool right, uint8_t color, uint8_t* fb) {
+  int back = right ? -7 : 7;
+  epd_draw_line(apexX + back, y - 7, apexX, y, color, fb);
+  epd_draw_line(apexX, y, apexX + back, y + 7, color, fb);
+}
+
+// "Now" marker: two bold chevrons pointing at each other near the column
+// edges — the row between them is the current time. 2 px black stroke
+// with a 1 px white halo (like the outlined block text) so they read on
+// white AND on dark shaded event blocks. Drawn as the LAST element of
+// the focus column (top layer) so nothing paints over them.
+static void drawNowArrows(int x, int colW, int y, uint8_t* fb) {
+  int lx = x + 19;              // '>' apex pointing right
+  int rx = x + colW - 19;       // '<' apex pointing left
+  // White halo: surrounds the 2 px stroke positions {(0,0), (1,0)}.
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 2; dx++) {
+      if ((dx == 0 || dx == 1) && dy == 0) continue;
+      drawNowChev(lx + dx, y + dy, true,  EPD_WHITE, fb);
+      drawNowChev(rx + dx, y + dy, false, EPD_WHITE, fb);
+    }
+  }
+  // Bold 2 px stroke: two passes offset horizontally.
+  for (int dx = 0; dx <= 1; dx++) {
+    drawNowChev(lx + dx, y, true,  EPD_BLACK, fb);
+    drawNowChev(rx + dx, y, false, EPD_BLACK, fb);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Weekly view (focus+context layout)
 // ---------------------------------------------------------------------------
 static void renderWeeklyView() {
   uint8_t* fb = display_mgr::framebuffer();
   memset(fb, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+  s_focusGeomValid = false;  // only today's focus column re-publishes it below
+
+  // Clock state + current minute-of-day, used only when the focus day IS
+  // today (sliding window + now marker). Pre-NTP cold boots have no valid
+  // clock (the demo build simulates one) and fall back to the
+  // deterministic static window.
+  time_t nowT = time(nullptr);
+  bool clockValid = (nowT >= 1700000000);
+  int nowMin = -1;
+  if (clockValid && s_baseDayOffset == 0) {
+    struct tm nowTm;
+    localtime_r(&nowT, &nowTm);
+    nowMin = nowTm.tm_hour * 60 + nowTm.tm_min;
+  }
 
   int winX, winY, winW, winH;
   getWindowRect(winX, winY, winW, winH);
@@ -1198,15 +1387,12 @@ static void renderWeeklyView() {
 
   constexpr int numCols = 3;  // Phase 10: focus + 2 context columns
   const int dayStartHour = resolvedDayStartHour();
-  const int dayEndHour   = resolvedDayEndHour();
 
   constexpr int COL_GAP = 8;
   // 3 columns: 2 context + 1 focus (focus = 2 × context).
   // Total width = 4 context units + 2 gaps → context_w = (cw - 2*gap) / 4
   int contextW = (cw - COL_GAP * 2) / 4;
   int focusW = contextW * 2;
-
-  const int dayMinutes = (dayEndHour - dayStartHour) * 60;
 
   struct tm base;
   getDemoBaseDay(base);
@@ -1340,53 +1526,50 @@ static void renderWeeklyView() {
 
     // --- Focus column only below this point ---
 
-    // Compute timeline range from the focus day's timed events.
-    // Duration snaps up to a "nice" value from {3,6,9,12,18,24} hours
-    // for consistent grid line spacing and visual rhythm.
-    // Start stays fixed (earliest event - 1h), end extends to fill the nice duration.
-    int focusRangeStart = 8 * 60;   // default: 8AM (all-day-only fallback)
-    int focusRangeEnd = 20 * 60;    // default: 8PM (12h default)
-    {
-      int earliest = 24 * 60;
-      int latest = 0;
-      bool hasTimed = false;
-      for (int e = 0; e < colCount; e++) {
-        const CalendarEvent& ev = s_events[colIndices[e]];
-        if (ev.allDay) continue;
-        hasTimed = true;
-        int s = ev.startHour * 60 + ev.startMin;
-        int en = s + ev.durationMin;
-        if (s < earliest) earliest = s;
-        if (en > latest) latest = en;
+    // Compute the timeline range from the focus day's timed events.
+    // Today (valid clock): sliding window — anchored at Day Start, follows
+    // "now − 1h", freezes at the last event (see computeTodayWindow).
+    // Any other day / unset clock: deterministic event-anchored window
+    // with a 6h-minimum nice-duration snap (computeStaticWindow).
+    // All-day-only days: static Day Start → 8 PM window.
+    int focusRangeStart = 8 * 60;
+    int focusRangeEnd = 20 * 60;
+    bool hasTimed = false;
+    int earliestStart = -1, lastEnd = -1, lastUpcomingEnd = -1;
+    for (int e = 0; e < colCount; e++) {
+      const CalendarEvent& ev = s_events[colIndices[e]];
+      if (ev.allDay) continue;
+      hasTimed = true;
+      int sMin = ev.startHour * 60 + ev.startMin;
+      int eMin = sMin + ev.durationMin;
+      if (earliestStart < 0 || sMin < earliestStart) earliestStart = sMin;
+      if (eMin > lastEnd) lastEnd = eMin;
+      if (nowMin >= 0 && eMin > nowMin && eMin > lastUpcomingEnd) lastUpcomingEnd = eMin;
+    }
+    bool focusScrolled = false;   // manual scroll-back currently applied?
+    if (hasTimed) {
+      FocusWindow w = (nowMin >= 0)
+                        ? computeTodayWindow(earliestStart, lastEnd, lastUpcomingEnd,
+                                             nowMin, dayStartHour)
+                        : computeStaticWindow(earliestStart, lastEnd);
+      // Manual scroll-back (today only): shift the whole window earlier so
+      // scrolled-off past events are visible again. The offset is clamped
+      // so the window never starts before earliest − 1h, and it resets on
+      // the next data/navigation change.
+      if (nowMin >= 0 && s_focusScrollOffsetMin != 0) {
+        int minStart = imax_(4 * 60, earliestStart - 60);
+        int off = s_focusScrollOffsetMin;
+        if (w.start + off < minStart) off = minStart - w.start;
+        if (off > 0) off = 0;
+        s_focusScrollOffsetMin = off;
+        w.start += off;
+        w.end += off;
+        focusScrolled = true;
       }
-      if (hasTimed) {
-        focusRangeStart = max(4 * 60, earliest - 60);     // no earlier than 4AM
-        int paddedEnd = min(28 * 60, latest + 60);         // no later than 4AM next day
-        int duration = paddedEnd - focusRangeStart;
-
-        // Snap duration up to the next nice value
-        const int niceDurations[] = {3*60, 6*60, 9*60, 12*60, 18*60, 24*60};
-        int niceDuration = 24 * 60;
-        for (int i = 0; i < 6; i++) {
-          if (niceDurations[i] >= duration) {
-            niceDuration = niceDurations[i];
-            break;
-          }
-        }
-
-        // Extend end to fit the nice duration (start stays fixed)
-        focusRangeEnd = focusRangeStart + niceDuration;
-
-        // Clamp to 4AM-4AM ceiling
-        if (focusRangeEnd > 28 * 60) {
-          focusRangeEnd = 28 * 60;
-          focusRangeStart = focusRangeEnd - niceDuration;
-          if (focusRangeStart < 4 * 60) {
-            focusRangeStart = 4 * 60;
-            focusRangeEnd = focusRangeStart + niceDuration;
-          }
-        }
-      }
+      focusRangeStart = w.start;
+      focusRangeEnd = w.end;
+    } else if (nowMin >= 0) {
+      focusRangeStart = imax_(4 * 60, dayStartHour * 60);   // all-day-only today
     }
     int focusRangeMinutes = focusRangeEnd - focusRangeStart;
 
@@ -1402,8 +1585,35 @@ static void renderWeeklyView() {
     // Timeline boundaries: minimal top padding (the start label extends upward
     // into the banner gap), full bottom padding for the end label.
     int focusTimelineTop  = focusContentTop + 4;
+    // The start time label ("── 8:00 AM ──") sits just BELOW the top
+    // boundary line, inside the timeline. Reserve its band: event blocks,
+    // gap fills, grid lines, and the now marker all plot from below it.
+    // Without this, a window starting exactly at an event's start (e.g.
+    // the frozen window's last event) paints the block over the label.
+    int focusPlotTop      = focusTimelineTop + 20;
     int focusTimelineBot  = (EPD_HEIGHT - 4) - 20;
-    int focusTimelineH    = focusTimelineBot - focusTimelineTop;
+    int focusTimelineH    = focusTimelineBot - focusPlotTop;
+
+    // Publish the rendered focus geometry + scroll affordances for touch
+    // hit-testing (see classifyGesture). Only today + valid clock.
+    s_focusGeomValid = (nowMin >= 0) && hasTimed;
+    if (s_focusGeomValid) {
+      s_focusColX = x;  s_focusColW = colW;
+      s_focusTop = focusTimelineTop;  s_focusBot = focusTimelineBot;
+      s_focusWinStart = focusRangeStart;  s_focusWinEnd = focusRangeEnd;
+      s_focusMinStart = imax_(4 * 60, earliestStart - 60);
+      bool hiddenAbove = false, hiddenBelow = false;
+      for (int e = 0; e < colCount; e++) {
+        const CalendarEvent& ev = s_events[colIndices[e]];
+        if (ev.allDay) continue;
+        int s2 = ev.startHour * 60 + ev.startMin;
+        int e2 = s2 + ev.durationMin;
+        if (e2 <= focusRangeStart) hiddenAbove = true;   // scrolled off the top
+        if (s2 >= focusRangeEnd)   hiddenBelow = true;   // beyond the window end
+      }
+      s_focusCanScrollUp   = hiddenAbove;
+      s_focusCanScrollDown = hiddenBelow || focusScrolled;
+    }
 
     // Scale minimum block height to timeline density. In dense timelines
     // (short range, many pixels per hour), the default MIN_BLOCK_HEIGHT
@@ -1457,20 +1667,27 @@ static void renderWeeklyView() {
         if (ev.allDay) continue;
 
         int startMin = ev.startHour * 60 + ev.startMin;
+        int endMin = startMin + ev.durationMin;
+        // Events that scrolled above the window must not anchor a gap:
+        // their mapped y is negative, which would smear gray over the
+        // column header. Skip them entirely (they're invisible here).
+        if (endMin <= focusRangeStart) continue;
         if (prevEndMin > 0 && (startMin - prevEndMin) >= 60) {
-          int prevEndY = focusTimelineTop
+          int prevEndY = focusPlotTop
                          + ((prevEndMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
-          int thisStartY = focusTimelineTop
+          int thisStartY = focusPlotTop
                            + ((startMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
           int gapY = prevEndY + EVENT_GAP;
-          int gapH = thisStartY - prevEndY - EVENT_GAP * 2;
-          if (gapH > 0) {
+          if (gapY < focusPlotTop) gapY = focusPlotTop;  // clip below the start label
+          int gapH = thisStartY - gapY - EVENT_GAP;
+          // Also clip at the bottom: a scrolled-back window can have
+          // events below its end, whose gaps would paint past the timeline.
+          if (gapH > 0 && gapY + gapH <= focusTimelineBot) {
             // Faint gray fill (shade 14, just barely darker than white)
             epd_fill_rect(x + 6, gapY, colW - 12, gapH, 14 << 4, fb);
           }
         }
 
-        int endMin = startMin + ev.durationMin;
         if (endMin > prevEndMin) prevEndMin = endMin;
       }
     }
@@ -1478,8 +1695,8 @@ static void renderWeeklyView() {
     // Grid lines at 1/3 and 2/3 of the timeline — drawn after gap fills
     // so the shade-14 fill doesn't overwrite them. Events render on top.
     {
-      int grid1Y = focusTimelineTop + focusTimelineH / 3;
-      int grid2Y = focusTimelineTop + (focusTimelineH * 2) / 3;
+      int grid1Y = focusPlotTop + focusTimelineH / 3;
+      int grid2Y = focusPlotTop + (focusTimelineH * 2) / 3;
       epd_draw_hline(x + 8, grid1Y, colW - 16, EPD_LTGRAY, fb);
       epd_draw_hline(x + 8, grid2Y, colW - 16, EPD_LTGRAY, fb);
     }
@@ -1496,7 +1713,7 @@ static void renderWeeklyView() {
       int visDur   = visEnd - visStart;
       if (visDur <= 0) continue;
 
-      int blockY = focusTimelineTop + ((visStart - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+      int blockY = focusPlotTop + ((visStart - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
       int blockH = computeBlockHeight(visDur, focusTimelineH, focusRangeMinutes, effectiveMinH);
 
       // Enforce minimum visual gap between non-overlapping events.
@@ -1512,7 +1729,7 @@ static void renderWeeklyView() {
           // Only enforce gap if there's actually a time gap (not overlapping)
           if (nextStartMin > endMin) {
             int nextVisStart = max(nextStartMin, focusRangeStart);
-            int nextY = focusTimelineTop + ((nextVisStart - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+            int nextY = focusPlotTop + ((nextVisStart - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
             int maxH = nextY - blockY - MIN_GAP_PX;
             if (blockH > maxH) blockH = maxH;
           }
@@ -1624,25 +1841,51 @@ static void renderWeeklyView() {
 
     }
 
-    // "Now" line — horizontal marker at the current time on today's focus
-    // column. Skipped when the clock isn't set (pre-NTP/demo), when the
-    // focus day isn't today, or when now is outside the drawn range.
-    {
-      time_t nowT = time(nullptr);
-      if (nowT >= 1700000000 && s_baseDayOffset == 0) {  // 1700000000 = earliest plausible epoch (clock-set check)
-        struct tm nowTm;
-        localtime_r(&nowT, &nowTm);
-        int nowMin = nowTm.tm_hour * 60 + nowTm.tm_min;
-        if (nowMin >= focusRangeStart && nowMin < focusRangeEnd) {
-          int nowY = focusTimelineTop
-                     + ((nowMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
-          // Black line with 1px white halo above/below: reads cleanly on the
-          // white background AND on dark shaded event blocks (the halo creates
-          // separation). Inset matches the existing grid/boundary line convention.
-          epd_draw_hline(x + 8, nowY - 1, colW - 16, EPD_WHITE, fb);
-          epd_draw_hline(x + 8, nowY,     colW - 16, EPD_BLACK, fb);
-          epd_draw_hline(x + 8, nowY + 1, colW - 16, EPD_WHITE, fb);
-        }
+    // Manual scroll arrows — deliberately small visuals (24 px) with much
+    // larger tap zones (see classifyGesture). Drawn only when content is
+    // actually clipped off that edge of the window.
+    if (s_focusGeomValid) {
+      if (s_focusCanScrollUp) {
+        int acx = x + colW - 30, acy = focusTimelineTop + 18;
+        epd_fill_circle(acx, acy, 12, EPD_WHITE, fb);
+        epd_draw_circle(acx, acy, 12, EPD_LTGRAY, fb);
+        drawChevron(acx, acy, true, EPD_BLACK, fb);
+      }
+      if (s_focusCanScrollDown) {
+        int acx = x + colW - 30, acy = focusTimelineBot - 18;
+        epd_fill_circle(acx, acy, 12, EPD_WHITE, fb);
+        epd_draw_circle(acx, acy, 12, EPD_LTGRAY, fb);
+        drawChevron(acx, acy, false, EPD_BLACK, fb);
+      }
+    }
+
+    // "Now" marker — two bold chevrons pointing at each other ('> · <')
+    // at the column edges, at the current time on today's focus column.
+    // Drawn LAST so it is the top layer — event blocks, gap fills, and
+    // scroll arrows can never cover it on a re-render/reload. When "now"
+    // is outside the drawn window the pair clamps just inside the
+    // boundary with an extra chevron pointing at the off-screen direction
+    // (early morning before the window starts, or evening past the frozen
+    // end) — so the marker never lies about where "now" is. Skipped when
+    // the clock isn't set (pre-NTP cold boot) or the focus day isn't
+    // today.
+    if (nowMin >= 0) {
+      int nowY;
+      int clampDir = 0;   // 0 = in range, -1 = pinned at top, +1 = pinned at bottom
+      if (nowMin < focusRangeStart) {
+        nowY = focusTimelineTop + 22;  clampDir = -1;
+      } else if (nowMin >= focusRangeEnd) {
+        nowY = focusTimelineBot - 22;  clampDir = +1;
+      } else {
+        nowY = focusPlotTop
+               + ((nowMin - focusRangeStart) * focusTimelineH) / focusRangeMinutes;
+      }
+      drawNowArrows(x, colW, nowY, fb);
+      // Clamp chevron on the left side (clear of the centered boundary
+      // time labels).
+      if (clampDir != 0) {
+        drawChevron(x + 34, clampDir < 0 ? nowY - 8 : nowY + 8, clampDir < 0,
+                    EPD_BLACK, fb);
       }
     }
 
@@ -1929,6 +2172,7 @@ void render() {
 void setEvents(const CalendarEvent* events, int count) {
   s_events = events;
   s_eventCount = count;
+  s_focusScrollOffsetMin = 0;   // fresh data → re-anchor the sliding window
   s_pendingRender = true;
 }
 void setLastUpdated(time_t epoch) { s_lastUpdated = epoch; }
@@ -1950,6 +2194,7 @@ void toggleSettings() {
   if (s_screen == SCREEN_SETTINGS) {
     // Close — restore the previous view with a full refresh.
     s_screen = s_prevScreen;
+    s_focusScrollOffsetMin = 0;
     s_pendingRender = true;
     s_refreshMode = REFRESH_FULL;
   } else {
@@ -1967,6 +2212,7 @@ void resetToDefaultView() {
   s_screen = SCREEN_WEEKLY;
   s_baseDayOffset = 0;
   s_selectedEventIdx = -1;
+  s_focusScrollOffsetMin = 0;
   s_pendingRender = true;
   s_refreshMode = REFRESH_FULL;
 }

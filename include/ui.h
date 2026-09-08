@@ -46,7 +46,8 @@ void updateTouch(bool isTouched, int16_t x, int16_t y);
 bool needsRender();
 
 // Returns the refresh mode for the pending render.
-// 0 = full refresh, 1 = partial settings refresh, 2 = partial daily refresh.
+// 0 = full refresh, 1 = partial settings refresh, 2 = partial daily refresh,
+// 3 = no-clear ghost refresh of the focus column (timeline scroll).
 int refreshMode();
 
 // Populates the dirty rectangle for a partial settings refresh.
@@ -54,5 +55,9 @@ void getSettingsDirtyRect(int& x, int& y, int& w, int& h);
 
 // Populates the dirty rectangle for a partial daily view refresh.
 void getDailyDirtyRect(int& x, int& y, int& w, int& h);
+
+// Populates the row range a timeline scroll can change (today's focus
+// column), for the no-clear ghost refresh.
+void getFocusGhostRect(int& x, int& y, int& w, int& h);
 
 } // namespace ui
