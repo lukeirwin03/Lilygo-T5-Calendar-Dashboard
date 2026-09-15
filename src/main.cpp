@@ -3,6 +3,7 @@
 #include "config.h"
 #include "display_manager.h"
 #include "conn_screen.h"
+#include "diff_test.h"
 #include "ui.h"
 #include "battery.h"
 #include "touch_input.h"
@@ -72,30 +73,42 @@ static void demoJumpTime(int hours) {
   ui::setEvents(testEvents, TEST_EVENT_COUNT);   // pending render + scroll reset
 }
 
-// Delay that any touch or button press breaks early — used to let the
-// connection animation be skipped.
-static void demoDelay(unsigned long ms) {
+// Delay that returns true as soon as any touch or button press lands —
+// callers use it to make the connection animation skippable.
+static bool demoDelay(unsigned long ms) {
   unsigned long start = millis();
   while (millis() - start < ms) {
-    if (touch_input::isTouched() || digitalRead(config::BUTTON_PIN) == LOW) return;
+    if (touch_input::isTouched() || digitalRead(config::BUTTON_PIN) == LOW) return true;
     delay(20);
   }
+  return false;
 }
 
-// Play the cold-boot connection screen so it can be photographed on the
-// demo build (dashboard env only shows it on a true no-cache cold boot).
-// Each band update is a cleared partial refresh (~1-2 s), so the stages
-// are paced for that; all four succeed.
+// Play the cold-boot connection screen so it can be photographed and the
+// flash-free differential refresh tuned on the demo build (dashboard env
+// only shows it on a true no-cache cold boot). Plays two full stage
+// cycles — the first all-success, the second ending in a failure label —
+// then continues; any touch or button press skips ahead.
 static void demoConnectionAnimation() {
-  Serial.println("[demo] Connection screen (touch/button skips)...");
+  Serial.println("[demo] Connection screen (2 cycles, touch/button skips)...");
   conn_screen::begin();
   for (int s = 0; s < 4; s++) {
     conn_screen::stageStart(s);
-    demoDelay(900);
+    if (demoDelay(800)) return;
+    conn_screen::tick();
+    if (demoDelay(800)) return;
     conn_screen::stageDone(s, true);
-    demoDelay(400);
+    if (demoDelay(500)) return;
   }
-  demoDelay(1500);   // hold the completed bar for photos
+  // Second cycle: same stages, but the final one fails — exercises the
+  // failure-label erase path ("No payload received").
+  for (int s = 0; s < 4; s++) {
+    conn_screen::stageStart(s);
+    if (demoDelay(800)) return;
+    conn_screen::stageDone(s, s == 3 ? false : true);
+    if (demoDelay(500)) return;
+  }
+  demoDelay(1200);   // hold the final state for photos
 }
 
 static void initTestEvents() {
@@ -233,6 +246,10 @@ void setup() {
   }
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
+
+  // Calibration first: the differential-refresh test screen loops until
+  // the button is pressed, then the connection animation plays.
+  diff_test::run();
 
   // Photogenic boot: play the connection screen animation (skippable).
   demoConnectionAnimation();

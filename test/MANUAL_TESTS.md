@@ -23,6 +23,8 @@ Run these on the actual device after flashing.
 - [ ] All-day events show in a black banner above the timeline; multi-day ones get ← / → arrows
 - [ ] Empty days show "No events" placeholder
 - [ ] Timeline duration never snaps below 6h
+- [ ] Today's column has a light-gray header band
+- [ ] At the ±Context-Days edge, the adjacent context column is hidden
 
 ## Weekly view — sliding window (today; easiest to verify on the demo build)
 - [ ] With one event 2–3 PM: morning render shows a window from Day Start (~7–8 AM) to ~4 PM
@@ -39,16 +41,24 @@ Run these on the actual device after flashing.
 - [ ] Scroll offset resets after the next data refresh or day navigation
 - [ ] Navigating to non-today days shows the deterministic compact event window (no arrows, no now marker)
 
+## Demo build — differential-refresh calibration screen
+- [ ] Runs at boot (before the connection animation); loops cycles until the button is pressed
+- [ ] Every cycle starts with a clean reset of all cells (×1 masked erase + fresh base ink) — no text stacking at the base-word re-ink on any row
+- [ ] ERASE x1 / DIFF SWAP rows: quality references (single-pass erase; shipping full-swap timing)
+- [ ] GAP 0 / GAP 100 / GAP 250 rows: same swap with shrinking settle gaps — compare cleanliness against DIFF SWAP; serial reports each phase's measured duration
+- [ ] RAPID x2 row: six gap-0, 2-pass-ink swaps back to back (total + average time reported) — the shipping configuration (gap 0, ink ×2 validated); watch for charge artifacts over repeated cycles
+- [ ] Serial log narrates and times every step (`[difftest]`, `[diff]`)
+- [ ] Connection screen: stage text erases fully with no offset ghosting (the 1-bit ink frames span the full panel height — sub-height frames land a row off from the 4-bit erase path)
+
 ## Demo build — photo walk-through
-- [ ] Boot plays the connection-screen animation: wordmark, "Starting up", then each stage (WiFi → clock → broker → calendar) with the label dots animating and the bar creeping; the status band flashes briefly on each update (that flash is the physical erase) and the text stays crisp/readable; ends on the full bar — touch or button skips
+- [ ] After the calibration screen, boot plays the connection-screen animation for two cycles (all-success, then one ending in the "No payload received" failure label); band updates are flash-free (differential refresh) and old stage text should erase to clean white; touch or button skips
+- [ ] If the white-ink erase leaves faint residue or the erase/draw still smear together, tune in display_manager.cpp's diffRefresh: `ERASE_PASSES` (erase strength, try 4-5), `ERASE_SETTLE_MS` (settle time between erase and draw), `INK_PASSES`/`INK_TIME_US` (solidity of the new ink), and `INK_MAX` (what counts as ink); the cleared partialRefresh fallback is a one-line swap in conn_screen's drawBand
 - [ ] Simulated clock starts at 9:42 AM (serial: `[demo] Simulated clock: ...`)
 - [ ] At 9:42 the today column shows the sliding window with the now marker near the top and the ▲ scroll arrow (the 6:30 AM jog has scrolled off)
 - [ ] Long-press the button (≥0.8 s) → clock jumps +2h and re-renders; short press still toggles the settings modal
 - [ ] Repeated jumps walk through: mid-day slide → last event done → frozen window with the last event at top → marker pinned ▼ at the bottom
 - [ ] Past midnight the clock wraps to 6 AM of the same demo day
 - [ ] Tap ▲/▼ scroll arrows and observe the ghost-refresh experiment — expected on this driver: old event blocks are NOT erased (a white target drives nothing), so blocks appear duplicated at their old and new positions until the next full refresh; judge whether that trade is acceptable or whether scroll should use the cleared refresh instead
-- [ ] Today's column has a light-gray header band; when clock is set and viewing today, a black "now" line crosses the focus timeline at the current time
-- [ ] At the ±Context-Days edge, the adjacent context column is hidden
 
 ## Weekly view — context columns
 - [ ] Left context shows previous day's events as text list (time + title)
