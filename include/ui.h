@@ -47,7 +47,8 @@ bool needsRender();
 
 // Returns the refresh mode for the pending render.
 // 0 = full refresh, 1 = partial settings refresh, 2 = partial daily refresh,
-// 3 = no-clear ghost refresh of the focus column (timeline scroll).
+// 3 = no-clear ghost refresh of the focus column (timeline scroll),
+// 4 = flash-free differential close of the settings modal.
 int refreshMode();
 
 // Populates the dirty rectangle for a partial settings refresh.

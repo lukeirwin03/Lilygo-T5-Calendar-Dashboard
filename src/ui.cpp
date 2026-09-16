@@ -89,8 +89,10 @@ static bool       s_pendingRender = false;
 // Refresh mode: full, or one of the partial variants. FOCUS is the
 // no-clear ("ghost") push of the focus column used by timeline scrolling —
 // fast, but prior frames leave faint ghosts until the next full refresh.
+// SETTINGS_CLOSE pushes the restored view through the modal's flash-free
+// differential refresh (no full-screen flash on modal close).
 enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS, REFRESH_PARTIAL_DAILY,
-                   REFRESH_PARTIAL_FOCUS };
+                   REFRESH_PARTIAL_FOCUS, REFRESH_SETTINGS_CLOSE };
 static RefreshMode s_refreshMode = REFRESH_FULL;
 
 // Focus-column (today only) sliding-window state. renderWeeklyView
@@ -1062,7 +1064,7 @@ void updateTouch(bool isTouched, int16_t x, int16_t y) {
       if (result == ui_settings::TAP_CLOSE) {
         s_screen = s_prevScreen;
         s_pendingRender = true;
-        s_refreshMode = REFRESH_FULL;
+        s_refreshMode = REFRESH_SETTINGS_CLOSE;
         s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
         // The closing tap leaves a finger on the panel. Gate further input
         // until it lifts so it isn't classified as a spurious weekly/daily
@@ -2192,11 +2194,13 @@ void toggleSettings() {
   s_startY = s_lastY = 0;
 
   if (s_screen == SCREEN_SETTINGS) {
-    // Close — restore the previous view with a full refresh.
+    // Close — restore the previous view via the modal's flash-free
+    // differential refresh (falls back to a full refresh if the prev
+    // buffer is unavailable).
     s_screen = s_prevScreen;
     s_focusScrollOffsetMin = 0;
     s_pendingRender = true;
-    s_refreshMode = REFRESH_FULL;
+    s_refreshMode = REFRESH_SETTINGS_CLOSE;
   } else {
     // Open — modal over the current view, partial refresh of the modal rect.
     s_prevScreen = s_screen;

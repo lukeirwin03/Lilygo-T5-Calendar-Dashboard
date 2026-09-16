@@ -5,6 +5,7 @@
 #include "display_manager.h"
 #include "dashboards/calendar_dashboard.h"
 #include "ui.h"
+#include "ui_settings.h"
 #include "networking.h"
 #include "conn_screen.h"
 #include "power_mgr.h"
@@ -111,16 +112,22 @@ static bool doRender() {
       Serial.println("[render] Partial refresh (daily)");
     } else if (mode == 1) {  // REFRESH_PARTIAL_SETTINGS (modal)
       ui::render();
-      int sx, sy, sw, sh;
-      ui::getSettingsDirtyRect(sx, sy, sw, sh);
-      display_mgr::partialRefresh(sx, sy, sw, sh);
-      Serial.println("[render] Partial refresh (settings)");
+      if (!ui_settings::diffPush()) {
+        int sx, sy, sw, sh;
+        ui::getSettingsDirtyRect(sx, sy, sw, sh);
+        display_mgr::partialRefresh(sx, sy, sw, sh);
+      }
+      Serial.println("[render] Diff update (settings)");
     } else if (mode == 3) {  // REFRESH_PARTIAL_FOCUS (timeline scroll, ghost)
       ui::render();
       int fx, fy, fw, fh;
       ui::getFocusGhostRect(fx, fy, fw, fh);
       display_mgr::ghostRefresh(fx, fy, fw, fh);
       Serial.println("[render] Ghost refresh (focus timeline)");
+    } else if (mode == 4) {  // REFRESH_SETTINGS_CLOSE (modal closing, cleared reflash)
+      ui::render();
+      ui_settings::closeReflash();
+      Serial.println("[render] Reflash (settings close)");
     } else {
       display_mgr::powerOn();
       epd_clear();

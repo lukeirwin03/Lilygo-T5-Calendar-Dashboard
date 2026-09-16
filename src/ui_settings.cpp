@@ -10,6 +10,7 @@
 #include "fonts/Genty20pt7b.h"
 #include <Arduino.h>
 #include <time.h>
+#include <cstring>
 
 namespace ui_settings {
 
@@ -32,16 +33,17 @@ static constexpr int BOTTOM_H = 62;
 static constexpr int MODAL_RIGHT  = MODAL_X + MODAL_W;
 static constexpr int MODAL_BOTTOM = MODAL_Y + MODAL_H;
 
-// Palette (4-bit grayscale, two nibbles per byte)
-static constexpr uint8_t C_BLACK  = 0;
-static constexpr uint8_t C_DKGRAY = 5;
-static constexpr uint8_t C_LTGRAY = 12;
-static constexpr uint8_t C_WHITE  = 15;
+// Palette (4-bit, two nibbles per byte) — BINARY ONLY. The modal's
+// in-modal updates are pushed via diffPush() through the 1-bit ink
+// path, whose ink predicate thresholds any nibble <= 12 to solid
+// black: a gray fill (5 or 12) would render black anyway, so grays are
+// meaningless here.
+// White glyphs on black fills are nibble 15 = paper = never driven.
+static constexpr uint8_t C_BLACK = 0;
+static constexpr uint8_t C_WHITE = 15;
 
-static constexpr uint8_t EPD_BLACK  = C_BLACK  << 4;
-static constexpr uint8_t EPD_DKGRAY = C_DKGRAY << 4;
-static constexpr uint8_t EPD_LTGRAY = C_LTGRAY << 4;
-static constexpr uint8_t EPD_WHITE  = C_WHITE  << 4;
+static constexpr uint8_t EPD_BLACK = C_BLACK << 4;
+static constexpr uint8_t EPD_WHITE = C_WHITE << 4;
 
 // The demo env excludes networking.cpp from the build (see platformio.ini).
 #ifdef ENV_DEMO
@@ -148,6 +150,14 @@ static bool s_contextDaysChanged = false;  // set when Context Days is cycled; c
 // Dirty tracking for partial refresh (y range within the modal).
 static int  s_dirtyY1 = 0, s_dirtyY2 = 0;
 static bool s_fullRedraw = false;
+
+// Tracked modal rect for the flash-free differential refresh — owns
+// the "previous frame" record for the modal's rows. The strips of
+// underlying view beside the modal are outside the region and are
+// never driven.
+static display_mgr::DiffRegion s_region;
+static bool s_diffOk = true;       // latched false if the record can't be allocated
+static bool s_freshOpen = false;   // set by markFullRedraw(); consumed by diffPush()
 
 // ---------------------------------------------------------------------------
 // Value cycling
@@ -364,17 +374,19 @@ static void drawSettingRow(int rowIdx, bool selected, uint8_t* fb) {
   rowRect(rowIdx, rx, ry, rw, rh);
 
   // Always clear the row to white first, then apply the highlight.
+  // Selected = inverted: black fill with WHITE glyphs (binary-perfect
+  // for the diff engine — white text is nibble 15, paper, no drive).
   epd_fill_rect(rx, ry, rw, rh, EPD_WHITE, fb);
   if (selected) {
-    epd_fill_rect(rx, ry, rw, rh, EPD_LTGRAY, fb);
+    epd_fill_rect(rx, ry, rw, rh, EPD_BLACK, fb);
   }
 
   // Label (left)
   {
     int32_t lx = rx + 16, ly = ry + ROW_H / 2 + 6;
     FontProperties props;
-    props.fg_color = C_BLACK;
-    props.bg_color = selected ? C_LTGRAY : C_WHITE;
+    props.fg_color = selected ? C_WHITE : C_BLACK;
+    props.bg_color = selected ? C_BLACK : C_WHITE;
     props.flags = 0;
     props.fallback_glyph = 0;
     write_mode((GFXfont*)&MeltSwashes16, rows[rowIdx].label, &lx, &ly, fb, BLACK_ON_WHITE, &props);
@@ -389,8 +401,8 @@ static void drawSettingRow(int rowIdx, bool selected, uint8_t* fb) {
     get_text_bounds((GFXfont*)&MeltSwashes16, valBuf, &tcx, &tcy, &tx1, &ty1, &tw, &th, NULL);
     int32_t vx = rx + rw - tw - 16, vy = ry + ROW_H / 2 + 6;
     FontProperties props;
-    props.fg_color = C_BLACK;
-    props.bg_color = selected ? C_LTGRAY : C_WHITE;
+    props.fg_color = selected ? C_WHITE : C_BLACK;
+    props.bg_color = selected ? C_BLACK : C_WHITE;
     props.flags = 0;
     props.fallback_glyph = 0;
     write_mode((GFXfont*)&MeltSwashes16, valBuf, &vx, &vy, fb, BLACK_ON_WHITE, &props);
@@ -400,8 +412,8 @@ static void drawSettingRow(int rowIdx, bool selected, uint8_t* fb) {
   if (selected) {
     int32_t ax = rx + 2, ay = ry + ROW_H / 2 + 6;
     FontProperties props;
-    props.fg_color = C_BLACK;
-    props.bg_color = C_LTGRAY;
+    props.fg_color = C_WHITE;
+    props.bg_color = C_BLACK;
     props.flags = 0;
     props.fallback_glyph = 0;
     write_mode((GFXfont*)&MeltSwashes16, ">", &ax, &ay, fb, BLACK_ON_WHITE, &props);
@@ -416,7 +428,7 @@ static void drawTabs(uint8_t* fb) {
     const char* name = categories[c].name;
 
     if (active) {
-      epd_fill_rect(tx, tabY, tabW, tabH, EPD_DKGRAY, fb);
+      epd_fill_rect(tx, tabY, tabW, tabH, EPD_BLACK, fb);
     } else {
       epd_fill_rect(tx, tabY, tabW, tabH, EPD_WHITE, fb);
       epd_draw_rect(tx, tabY, tabW, tabH, EPD_BLACK, fb);
@@ -429,7 +441,7 @@ static void drawTabs(uint8_t* fb) {
     int32_t lx = tx + (tabW - tw) / 2, ly = tabY + tabH / 2 + 6;
     FontProperties props;
     props.fg_color = active ? C_WHITE : C_BLACK;
-    props.bg_color = active ? C_DKGRAY : C_WHITE;
+    props.bg_color = active ? C_BLACK : C_WHITE;
     props.flags = 0;
     props.fallback_glyph = 0;
     write_mode((GFXfont*)&MeltSwashes16, name, &lx, &ly, fb, BLACK_ON_WHITE, &props);
@@ -442,13 +454,13 @@ static void drawBottomBar(uint8_t* fb) {
 
   // Separator line at the top of the bottom region.
   epd_draw_hline(MODAL_X + MARGIN, MODAL_BOTTOM - BOTTOM_H,
-                 MODAL_W - 2 * MARGIN, EPD_LTGRAY, fb);
+                 MODAL_W - 2 * MARGIN, EPD_BLACK, fb);
 
   // − button (left-pointing filled triangle)
   epd_fill_triangle(minusX, btnY + btnSize / 2,
                     minusX + btnSize, btnY,
                     minusX + btnSize, btnY + btnSize,
-                    EPD_DKGRAY, fb);
+                    EPD_BLACK, fb);
   epd_draw_line(minusX, btnY + btnSize / 2, minusX + btnSize, btnY, EPD_BLACK, fb);
   epd_draw_line(minusX + btnSize, btnY, minusX + btnSize, btnY + btnSize, EPD_BLACK, fb);
   epd_draw_line(minusX + btnSize, btnY + btnSize, minusX, btnY + btnSize / 2, EPD_BLACK, fb);
@@ -457,13 +469,13 @@ static void drawBottomBar(uint8_t* fb) {
   epd_fill_triangle(plusX + btnSize, btnY + btnSize / 2,
                     plusX, btnY,
                     plusX, btnY + btnSize,
-                    EPD_DKGRAY, fb);
+                    EPD_BLACK, fb);
   epd_draw_line(plusX + btnSize, btnY + btnSize / 2, plusX, btnY, EPD_BLACK, fb);
   epd_draw_line(plusX, btnY, plusX, btnY + btnSize, EPD_BLACK, fb);
   epd_draw_line(plusX, btnY + btnSize, plusX + btnSize, btnY + btnSize / 2, EPD_BLACK, fb);
 
-  // Save button (filled DKGRAY, white text)
-  epd_fill_rect(saveX, btnY, saveW, btnSize, EPD_DKGRAY, fb);
+  // Save button (filled black, white text)
+  epd_fill_rect(saveX, btnY, saveW, btnSize, EPD_BLACK, fb);
   epd_draw_rect(saveX, btnY, saveW, btnSize, EPD_BLACK, fb);
   {
     const char* txt = "Save";
@@ -473,14 +485,14 @@ static void drawBottomBar(uint8_t* fb) {
     int32_t lx = saveX + (saveW - tw) / 2, ly = btnY + btnSize / 2 + 6;
     FontProperties props;
     props.fg_color = C_WHITE;
-    props.bg_color = C_DKGRAY;
+    props.bg_color = C_BLACK;
     props.flags = 0;
     props.fallback_glyph = 0;
     write_mode((GFXfont*)&MeltSwashes16, txt, &lx, &ly, fb, BLACK_ON_WHITE, &props);
   }
 
   // Sync button (same style as Save, immediately to its left)
-  epd_fill_rect(syncX, btnY, saveW, btnSize, EPD_DKGRAY, fb);
+  epd_fill_rect(syncX, btnY, saveW, btnSize, EPD_BLACK, fb);
   epd_draw_rect(syncX, btnY, saveW, btnSize, EPD_BLACK, fb);
   {
     const char* txt = "Sync";
@@ -490,7 +502,7 @@ static void drawBottomBar(uint8_t* fb) {
     int32_t lx = syncX + (saveW - tw) / 2, ly = btnY + btnSize / 2 + 6;
     FontProperties props;
     props.fg_color = C_WHITE;
-    props.bg_color = C_DKGRAY;
+    props.bg_color = C_BLACK;
     props.flags = 0;
     props.fallback_glyph = 0;
     write_mode((GFXfont*)&MeltSwashes16, txt, &lx, &ly, fb, BLACK_ON_WHITE, &props);
@@ -570,7 +582,10 @@ void render() {
   drawBottomBar(fb);
 }
 
-void markFullRedraw() { s_fullRedraw = true; }
+void markFullRedraw() {
+  s_fullRedraw = true;
+  s_freshOpen = true;   // next diffPush() runs the opening white wipe
+}
 
 void getDirtyRect(int& x, int& y, int& w, int& h) {
   if (s_fullRedraw) {
@@ -585,6 +600,60 @@ void getDirtyRect(int& x, int& y, int& w, int& h) {
   w = MODAL_W;
   h = s_dirtyY2 - s_dirtyY1;
   if (h < 1) h = ROW_H;
+}
+
+// ---------------------------------------------------------------------------
+// Flash-free differential-refresh lifecycle
+// ---------------------------------------------------------------------------
+bool diffPush() {
+  if (!s_diffOk) return false;
+  if (!s_region.begin(MODAL_X, MODAL_Y, MODAL_W, MODAL_H)) {
+    s_diffOk = false;
+    return false;
+  }
+
+  if (s_freshOpen) {
+    // First push after open: wipeWhite() whitens only the modal's
+    // columns — strips keep their ink and are outside the tracked
+    // region entirely (this also wipes any ghost-scroll residue from
+    // the view underneath).
+    s_region.wipeWhite();
+    s_freshOpen = false;
+  }
+
+  if (s_fullRedraw) {
+    // Open / tab switch: full swap of the modal. The unchanged title
+    // and bottom bars are persisted so their ink is never re-driven.
+    // (On the open push they're inert anyway: the wipe just recorded
+    // the whole region as paper.)
+    display_mgr::PersistRect persist[2] = {
+      { MODAL_X, MODAL_Y, MODAL_W, TITLE_H },
+      { MODAL_X, MODAL_BOTTOM - BOTTOM_H, MODAL_W, BOTTOM_H },
+    };
+    s_region.update(persist, 2);
+    s_fullRedraw = false;
+  } else {
+    // Row edit: swap only the touched rows (cheaper than the full
+    // rect). The region's x-limit leaves the strips beside the modal
+    // undriven by construction.
+    int dy1 = s_dirtyY1, dy2 = s_dirtyY2;      // row band from tap handling
+    int row = dy1 - MODAL_Y, count = dy2 - dy1;
+    if (count < 1) count = 1;
+    s_region.updateRows(row, count);
+  }
+  return true;
+}
+
+// Close-time reflash: a CLEARED partial refresh of the modal's row
+// range with the freshly re-rendered view. Unlike the diff pushes,
+// this fully resets those pixels (any charge buildup from the
+// repeated diff drives, plus ghost residue, is wiped) and pulls the
+// current data. Call AFTER ui::render() restored the underlying
+// screen. (partialRefresh clears full-width rows by design — a
+// sub-width clear leaves drive boundaries that darken the panel's
+// edges over time; see its comments in display_manager.cpp.)
+void closeReflash() {
+  display_mgr::partialRefresh(MODAL_X, MODAL_Y, MODAL_W, MODAL_H);
 }
 
 // ---------------------------------------------------------------------------

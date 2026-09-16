@@ -87,7 +87,7 @@ Run these on the actual device after flashing.
 - [ ] No ghosting at the edges of the partial refresh area after multiple toggles
 
 ## Settings modal
-- [ ] Button press → settings modal opens over the current view (partial refresh)
+- [ ] Button press → settings modal opens over the current view (flash-free differential refresh)
 - [ ] Title bar shows battery glyph + percentage
 - [ ] Tabs: Display, Power, Diagnostics
 - [ ] Tap a setting row → highlights it
@@ -95,8 +95,17 @@ Run these on the actual device after flashing.
 - [ ] Diagnostics tab shows Last Updated age, WiFi/MQTT last-attempt outcome ("Last: OK" / "Last: fail" after a refresh; "Off" before the first attempt after power-on; live "On −xxdBm" only if opened mid-connection), battery, free memory
 - [ ] Tap Save → writes `/config/settings.json` to SD card and closes the modal
 - [ ] Tap Sync → closes the modal and forces a fresh MQTT pull (calendar re-renders when data lands)
-- [ ] Tap Close (or button) → returns to the previous view (full refresh)
+- [ ] Tap Close (or button) → returns to the previous view (brief cleared reflash of the modal's rows — no full-screen flash)
 - [ ] Changing Context Days applies on modal close (event window reloads from cache)
+
+## Settings modal flash-free (diff refresh)
+- [ ] Open the modal with the button → ONE gentle white wipe touching ONLY the modal's columns (x 100..860 of rows 60..480), then the modal inks in — no flashing clear cycle anywhere
+- [ ] The strips of underlying view beside the modal (x < 100 and x ≥ 860) keep their ink through open and every in-modal update — no white flash band on open, no churn there on row taps
+- [ ] The white wipe on open also erases any ghost-scroll residue left under the modal's columns by earlier timeline scrolls
+- [ ] Tap rows / tap − or + → fast binary swap of just the affected row band, driving only the modal's columns (~half a second, no flash)
+- [ ] Switch tabs → tab content swaps; the strips, title bar and bottom bar are passed as persistent rects and stay untouched (their ink is never re-driven — watch for zero flicker there)
+- [ ] Close (button, Close X, or Save) → a brief cleared reflash of the modal's row range (rows 60..480): a localized flash there is expected and intentional — it resets the pixels and pulls fresh data; the strips reflash with it because the clear is full-width
+- [ ] Restyle check: selected rows render INVERTED (black fill, white label/value/">" glyph); active tab, ± triangles, Save/Sync buttons and the separator line are solid black — no grays anywhere in the modal (grays threshold to black under the 1-bit ink path)
 
 ## Cache & dedup
 - [ ] Publish a payload including past events that are also in the day cache → each occurrence renders exactly once (no duplicates)

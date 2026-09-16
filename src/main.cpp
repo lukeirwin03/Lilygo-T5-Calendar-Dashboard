@@ -5,6 +5,7 @@
 #include "conn_screen.h"
 #include "diff_test.h"
 #include "ui.h"
+#include "ui_settings.h"
 #include "battery.h"
 #include "touch_input.h"
 #include "power_mgr.h"
@@ -273,16 +274,22 @@ static void doRender() {
     Serial.println("[demo] Partial refresh (daily)");
   } else if (mode == 1) {  // REFRESH_PARTIAL_SETTINGS (modal)
     ui::render();
-    int sx, sy, sw, sh;
-    ui::getSettingsDirtyRect(sx, sy, sw, sh);
-    display_mgr::partialRefresh(sx, sy, sw, sh);
-    Serial.println("[demo] Partial refresh (settings)");
+    if (!ui_settings::diffPush()) {
+      int sx, sy, sw, sh;
+      ui::getSettingsDirtyRect(sx, sy, sw, sh);
+      display_mgr::partialRefresh(sx, sy, sw, sh);
+    }
+    Serial.println("[demo] Diff update (settings)");
   } else if (mode == 3) {  // REFRESH_PARTIAL_FOCUS (timeline scroll, ghost)
     ui::render();
     int fx, fy, fw, fh;
     ui::getFocusGhostRect(fx, fy, fw, fh);
     display_mgr::ghostRefresh(fx, fy, fw, fh);
     Serial.println("[demo] Ghost refresh (focus timeline)");
+  } else if (mode == 4) {  // REFRESH_SETTINGS_CLOSE (modal closing, cleared reflash)
+    ui::render();
+    ui_settings::closeReflash();
+    Serial.println("[demo] Reflash (settings close)");
   } else {
     display_mgr::powerOn();
     epd_clear();
