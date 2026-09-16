@@ -39,11 +39,8 @@ void fullRefresh() {
 }
 
 void partialRefresh(int x, int y, int w, int h) {
-  // Align x and w to 4-pixel boundaries for the clear operation.
-  int alignedX = (x / 4) * 4;
-  w += (x - alignedX);
-  w = ((w + 3) / 4) * 4;
-  x = alignedX;
+  // x/w are intentionally unused (row-range semantics): the clear and
+  // draw areas below are full-width by design, so only y/h matter.
 
   // Copy FULL-WIDTH lines from the framebuffer. The EPD driver's
   // provide_out() function pads sub-region lines with white (255), which
@@ -161,10 +158,11 @@ void whiteInkRefresh(int y, int h, const uint8_t* maskBand, int passes) {
   epd_poweroff();
 }
 
-bool inkRefresh(int y, int h, int passes,
+bool inkRefresh(int x, int y, int w, int h, int passes,
                 const uint8_t* prevBand,
                 const PersistRect* persist, int persistCount) {
-  // Draw solid 1-bit black ink from the framebuffer over the band.
+  // Draw solid 1-bit black ink from the framebuffer over rows [y, y+h),
+  // columns [x, x+w) only — pixels outside the rect receive no drive.
   // Packing follows the driver's 1-bit conventions (reverse-engineered
   // in the notepad project): 8 pixels/byte with the LEFTMOST pixel in
   // the LOW bit, and each byte written to index (b ^ 1) — the driver's
@@ -186,6 +184,7 @@ bool inkRefresh(int y, int h, int passes,
   bool usePersist = persist != nullptr && persistCount > 0 && prevBand != nullptr;
   int fullLineBytes = EPD_WIDTH / 2;
   int bytesPerRow = EPD_WIDTH / 8;
+  int xEnd = x + w;
   uint8_t* ink = (uint8_t*)ps_malloc((size_t)bytesPerRow * EPD_HEIGHT);
   if (!ink) return false;
   memset(ink, 0, (size_t)bytesPerRow * EPD_HEIGHT);
@@ -194,10 +193,11 @@ bool inkRefresh(int y, int h, int passes,
     const uint8_t* prev = usePersist ? prevBand + row * fullLineBytes : nullptr;
     uint8_t* rowPtr = ink + (y + row) * bytesPerRow;
     int absY = y + row;
-    for (int b = 0; b < bytesPerRow; b++) {
+    for (int b = x / 8; b <= (xEnd - 1) / 8; b++) {
       uint8_t byte = 0;
       for (int bit = 0; bit < 8; bit++) {
         int srcX = b * 8 + bit;
+        if (srcX < x || srcX >= xEnd) continue;   // outside the rect's columns
         uint8_t nib = (srcX & 1) ? (cur[srcX / 2] >> 4) & 0x0F
                                  : cur[srcX / 2] & 0x0F;
         if (nib > INK_MAX) continue;
@@ -226,10 +226,11 @@ bool inkRefresh(int y, int h, int passes,
   return true;
 }
 
-void diffRefresh(int y, int h, uint8_t* prevBand,
+void diffRefresh(int x, int y, int w, int h, uint8_t* prevBand,
                  const PersistRect* persist, int persistCount) {
-  // FULL-SWAP flash-free update — the workflow measured best on hardware
-  // (diff-test screen: quality rows + speed lab):
+  // FULL-SWAP flash-free update of the rect's row band — the workflow
+  // measured best on hardware (diff-test screen: quality rows + speed
+  // lab):
   //   1. ONE white-ink pass over ALL previous ink — total separation:
   //      nothing old remains near the new content, and every pixel of
   //      the new content gets identical fresh drive (uniform ink). x1
@@ -239,9 +240,10 @@ void diffRefresh(int y, int h, uint8_t* prevBand,
   //      back-to-back gap-0 swaps, legible, artifact-free).
   //   3. Two solid ink passes over ALL current ink — speed-lab-validated
   //      legibility (~8 passes for fully solid black if ever needed).
-  // Paper/background pixels are never driven (the whole-band WIPE
-  // approach greyed the background over time); prevBand supplies what
-  // ink is physically on the panel for the erase mask.
+  // Columns outside [x, x+w) are never driven, and paper/background
+  // pixels are never driven either (the whole-band WIPE approach greyed
+  // the background over time); prevBand supplies what ink is physically
+  // on the panel for the erase mask.
   //
   // PERSISTENT RECTS (optional): regions of append-only or UNCHANGED
   // content (a progress bar; a label that didn't change this update).
@@ -255,6 +257,7 @@ void diffRefresh(int y, int h, uint8_t* prevBand,
 
   int fullLineBytes = EPD_WIDTH / 2;
   bool usePersist = persist != nullptr && persistCount > 0;
+  int xEnd = x + w;
 
   // Fallback path: cleared refresh + prev update (always correct, flashes).
   auto fallbackCleared = [&]() {
@@ -271,9 +274,12 @@ void diffRefresh(int y, int h, uint8_t* prevBand,
     fallbackCleared();
     return;
   }
+  // Default: no drive anywhere; only the rect's columns get computed.
+  memset(temp, 0xFF, (size_t)fullLineBytes * h);
 
-  // Erase mask: ALL previous ink — except inside persistent rects, where
-  // only shrinking pixels (prev ink, now paper) are erased.
+  // Erase mask: ALL previous ink inside the rect's columns — except
+  // inside persistent rects, where only shrinking pixels (prev ink,
+  // now paper) are erased. Columns outside [x, x+w) stay no-drive.
   bool anyErase = false;
   int erasePx = 0, inkPx = 0;
   for (int row = 0; row < h; row++) {
@@ -281,21 +287,23 @@ void diffRefresh(int y, int h, uint8_t* prevBand,
     const uint8_t* cur  = g_framebuffer + (y + row) * fullLineBytes;
     uint8_t* out = temp + row * fullLineBytes;
     int absY = y + row;
-    for (int b = 0; b < fullLineBytes; b++) {
+    for (int b = x / 2; b <= (xEnd - 1) / 2; b++) {
       uint8_t prevHi = prev[b] >> 4;
       uint8_t prevLo = prev[b] & 0x0F;
       uint8_t curHi  = cur[b] >> 4;
       uint8_t curLo  = cur[b] & 0x0F;
+      bool hiIn = (b * 2 + 1 >= x) && (b * 2 + 1 < xEnd);
+      bool loIn = (b * 2 >= x) && (b * 2 < xEnd);
       bool persistHi = usePersist && inAnyPersist(persist, persistCount, b * 2 + 1, absY);
       bool persistLo = usePersist && inAnyPersist(persist, persistCount, b * 2, absY);
-      uint8_t hi = (prevHi <= INK_MAX && (!persistHi || curHi > INK_MAX)) ? 0x0 : 0xF;
-      uint8_t lo = (prevLo <= INK_MAX && (!persistLo || curLo > INK_MAX)) ? 0x0 : 0xF;
+      uint8_t hi = (hiIn && prevHi <= INK_MAX && (!persistHi || curHi > INK_MAX)) ? 0x0 : 0xF;
+      uint8_t lo = (loIn && prevLo <= INK_MAX && (!persistLo || curLo > INK_MAX)) ? 0x0 : 0xF;
       out[b] = (hi << 4) | lo;
       if (out[b] != 0xFF) {
         anyErase = true;
         erasePx += (hi == 0x0) + (lo == 0x0);
       }
-      inkPx += (curHi <= INK_MAX) + (curLo <= INK_MAX);
+      inkPx += (hiIn && curHi <= INK_MAX) + (loIn && curLo <= INK_MAX);
     }
   }
   Serial.printf("[diff] y=%d h=%d: erase %d px (x1), ink %d px, %d persist rect(s)\n",
@@ -309,7 +317,7 @@ void diffRefresh(int y, int h, uint8_t* prevBand,
   free(temp);
 
   // 2) Ink: everything except already-inked persistent-rect pixels.
-  if (!inkRefresh(y, h, INK_PASSES,
+  if (!inkRefresh(x, y, w, h, INK_PASSES,
                   usePersist ? prevBand : nullptr,
                   persist, persistCount)) {
     fallbackCleared();
@@ -323,6 +331,80 @@ void diffRefresh(int y, int h, uint8_t* prevBand,
   }
 }
 
-uint8_t* framebuffer() { return g_framebuffer; }
+// --- DiffRegion ------------------------------------------------------------
 
+bool DiffRegion::begin(int rx, int ry, int rw, int rh) {
+  int fullLineBytes = EPD_WIDTH / 2;
+  if (prev && x == rx && y == ry && w == rw && h == rh) {
+    return true;   // same rect — keep the existing record
+  }
+  free(prev);
+  prev = nullptr;
+  x = rx; y = ry; w = rw; h = rh;
+  // Full-width lines so the band-relative prev logic in diffRefresh
+  // works on the region's rows unchanged.
+  prev = (uint8_t*)ps_malloc((size_t)fullLineBytes * h);
+  if (!prev) {
+    x = y = w = h = 0;   // zeroed rect so a later begin() retries
+    return false;
+  }
+  memset(prev, 0xFF, (size_t)fullLineBytes * h);
+  return true;
+}
+
+void DiffRegion::syncFromFb() {
+  if (!prev) return;
+  int fullLineBytes = EPD_WIDTH / 2;
+  memcpy(prev, g_framebuffer + (size_t)y * fullLineBytes,
+         (size_t)fullLineBytes * h);
+}
+
+void DiffRegion::wipeWhite() {
+  if (!prev) return;
+  int fullLineBytes = EPD_WIDTH / 2;
+  size_t bandBytes = (size_t)fullLineBytes * h;
+  uint8_t* mask = (uint8_t*)ps_malloc(bandBytes);
+  if (!mask) return;   // can't build the mask — leave panel and record alone
+  memset(mask, 0xFF, bandBytes);   // default: no drive anywhere
+  for (int row = 0; row < h; row++) {
+    // Zero exactly the nibbles for columns [x, x+w); nibbles outside
+    // the rect stay no-drive. Byte b holds pixel 2b (low nibble) and
+    // 2b+1 (high nibble).
+    uint8_t* line = mask + (size_t)row * fullLineBytes;
+    int b0 = x / 2, b1 = (x + w - 1) / 2;
+    if (b1 > b0 + 1)
+      memset(line + b0 + 1, 0x00, (size_t)(b1 - b0 - 1));
+    uint8_t first = (x & 1) ? 0x0F : 0x00;        // keep low nibble if x odd
+    uint8_t last = ((x + w) & 1) ? 0xF0 : 0x00;   // keep high nibble if right edge odd
+    if (b0 == b1) {
+      line[b0] &= first | last;   // one byte spans both edges — OR the keeps
+    } else {
+      line[b0] &= first;
+      line[b1] &= last;
+    }
+  }
+  whiteInkRefresh(y, h, mask, 1);
+  free(mask);
+  // Columns outside the rect are never consulted, so recording the
+  // whole band as white is correct (and simpler).
+  memset(prev, 0xFF, bandBytes);
+}
+
+void DiffRegion::update(const PersistRect* persist, int persistCount) {
+  if (!prev) return;
+  diffRefresh(x, y, w, h, prev, persist, persistCount);
+}
+
+void DiffRegion::updateRows(int row, int count,
+                            const PersistRect* persist, int persistCount) {
+  if (!prev) return;
+  if (row < 0) { count += row; row = 0; }
+  if (row + count > h) count = h - row;
+  if (count < 1) return;
+  int fullLineBytes = EPD_WIDTH / 2;
+  diffRefresh(x, y + row, w, count, prev + (size_t)row * fullLineBytes,
+              persist, persistCount);
+}
+
+uint8_t* framebuffer() { return g_framebuffer; }
 } // namespace display_mgr

@@ -130,7 +130,7 @@ static void resetCellClean(int r, uint8_t* fb, uint8_t* mask) {
   display_mgr::whiteInkRefresh(rowY(r), ROW_H, mask, 1);
   delay(1000);   // same erase→ink gap as diffRefresh (observed-clean timing)
   drawCellText(r, fb, "Quixotic 42");
-  display_mgr::inkRefresh(rowY(r), ROW_H, 8);
+  display_mgr::inkRefresh(0, rowY(r), EPD_WIDTH, ROW_H, 8);
   syncPrev(r);
 }
 
@@ -149,7 +149,7 @@ static void speedSwap(int r, uint8_t* fb, uint8_t* mask, const char* word,
   if (gapMs > 0) delay(gapMs);
   unsigned long tGap = millis();
   drawCellText(r, fb, word);
-  display_mgr::inkRefresh(rowY(r), ROW_H, inkPasses);
+  display_mgr::inkRefresh(0, rowY(r), EPD_WIDTH, ROW_H, inkPasses);
   unsigned long tInk = millis();
   syncPrev(r);
   Serial.printf("[difftest] row %d (%s): erase %lu ms + gap %d ms + ink x%d %lu ms = %lu ms total\n",
@@ -222,7 +222,7 @@ void run() {
     Serial.printf("[difftest] cycle %d: swap row 1 via diffRefresh (shipping timing)\n", cycle);
     fillCellWhite(1, fb);
     drawCellText(1, fb, (cycle % 2) ? "Alpha 7" : "Omega 7");
-    display_mgr::diffRefresh(rowY(1), ROW_H,
+    display_mgr::diffRefresh(0, rowY(1), EPD_WIDTH, ROW_H,
                              s_prev + rowY(1) * fullLineBytes);
     exit = waitBtn(1500);
     if (exit) break;

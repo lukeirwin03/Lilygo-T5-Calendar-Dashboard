@@ -84,9 +84,12 @@ static float s_completed = 0.0f;    // bar fraction earned by completed stages
 static float s_showing = 0.0f;      // fraction currently drawn
 static int   s_dots = 1;            // animated 1..3 dots after the label
 
-// Band pixels as last pushed to the panel — the "previous frame" for the
-// minimal-drive differential refresh (only changed pixels are driven).
-static uint8_t s_prevBand[(960 / 2) * 96];
+// Tracked band for the flash-free differential refresh — owns the
+// "previous frame" record (only changed pixels are driven). If the
+// record can't be allocated, drawBand falls back to cleared band
+// refreshes (partialRefresh).
+static display_mgr::DiffRegion s_band;
+static bool s_diffOk = true;
 
 // Bounds of the currently-drawn stage label (text only, no dots), used
 // to exclude an unchanged label from each refresh.
@@ -193,7 +196,11 @@ static void drawBand() {
   if (!labelChanged && s_labelW > 0) {
     persist[persistCount++] = { s_labelX, s_labelY, s_labelW, s_labelH };
   }
-  display_mgr::diffRefresh(BAND_Y, BAND_H, s_prevBand, persist, persistCount);
+  if (s_diffOk) {
+    s_band.update(persist, persistCount);
+  } else {
+    display_mgr::partialRefresh(0, BAND_Y, EPD_WIDTH, BAND_H);
+  }
   s_lastPanelMs = millis();
 }
 
@@ -265,12 +272,14 @@ void begin() {
     s_labelY = ly1; s_labelH = lh;
     strlcpy(s_drawnLabel, label, sizeof(s_drawnLabel));
   }
-  display_mgr::inkRefresh(BAND_Y, BAND_H, 8);
+  display_mgr::inkRefresh(0, BAND_Y, EPD_WIDTH, BAND_H, 8);
   s_drawnDots = 0;
   s_drawnFillW = 0;
-  // The band is on the panel exactly as in the framebuffer — seed the
-  // differential refresh's "previous frame" from it.
-  memcpy(s_prevBand, fb + (BAND_Y * EPD_WIDTH / 2), (EPD_WIDTH / 2) * BAND_H);
+  // The band is on the panel exactly as in the framebuffer — record it
+  // as the region's "previous frame". (If the record can't be
+  // allocated, drawBand falls back to cleared band refreshes.)
+  s_diffOk = s_band.begin(0, BAND_Y, EPD_WIDTH, BAND_H);
+  if (s_diffOk) s_band.syncFromFb();
   Serial.println("[conn] Connection screen drawn");
 }
 
