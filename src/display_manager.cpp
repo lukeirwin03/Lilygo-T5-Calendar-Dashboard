@@ -226,6 +226,63 @@ bool inkRefresh(int x, int y, int w, int h, int passes,
   return true;
 }
 
+// Build the white-ink erase mask for rows [y, y+h), columns [x, x+w):
+// nibble 0 = drive that pixel to white, 0xF = no drive. ALL previous ink
+// (nibble <= inkMax) inside the rect's columns is erased — except inside
+// persistent rects, where only shrinking pixels (prev ink, now paper) are
+// erased. Columns outside [x, x+w) stay no-drive. prevBand is band-relative
+// (row 0 = y). inkMax sets what counts as ink: the binary diffRefresh path
+// thresholds at 12, the gray updateGray path must erase up to 14. Also
+// reports whether anything needs erasing, the erased pixel count, and —
+// for the caller's serial log — the current ink pixel count (same
+// inkMax predicate; nullable). Returns nullptr on alloc failure.
+static uint8_t* buildEraseMask(int x, int y, int w, int h,
+                               const uint8_t* prevBand,
+                               const PersistRect* persist, int persistCount,
+                               int inkMax,
+                               bool* anyEraseOut, int* erasePxOut,
+                               int* inkPxOut = nullptr) {
+  int fullLineBytes = EPD_WIDTH / 2;
+  bool usePersist = persist != nullptr && persistCount > 0;
+  int xEnd = x + w;
+
+  uint8_t* temp = (uint8_t*)ps_malloc(fullLineBytes * h);
+  if (!temp) return nullptr;
+  // Default: no drive anywhere; only the rect's columns get computed.
+  memset(temp, 0xFF, (size_t)fullLineBytes * h);
+
+  bool anyErase = false;
+  int erasePx = 0, inkPx = 0;
+  for (int row = 0; row < h; row++) {
+    const uint8_t* prev = prevBand + row * fullLineBytes;
+    const uint8_t* cur  = g_framebuffer + (y + row) * fullLineBytes;
+    uint8_t* out = temp + row * fullLineBytes;
+    int absY = y + row;
+    for (int b = x / 2; b <= (xEnd - 1) / 2; b++) {
+      uint8_t prevHi = prev[b] >> 4;
+      uint8_t prevLo = prev[b] & 0x0F;
+      uint8_t curHi  = cur[b] >> 4;
+      uint8_t curLo  = cur[b] & 0x0F;
+      bool hiIn = (b * 2 + 1 >= x) && (b * 2 + 1 < xEnd);
+      bool loIn = (b * 2 >= x) && (b * 2 < xEnd);
+      bool persistHi = usePersist && inAnyPersist(persist, persistCount, b * 2 + 1, absY);
+      bool persistLo = usePersist && inAnyPersist(persist, persistCount, b * 2, absY);
+      uint8_t hi = (hiIn && prevHi <= inkMax && (!persistHi || curHi > inkMax)) ? 0x0 : 0xF;
+      uint8_t lo = (loIn && prevLo <= inkMax && (!persistLo || curLo > inkMax)) ? 0x0 : 0xF;
+      out[b] = (hi << 4) | lo;
+      if (out[b] != 0xFF) {
+        anyErase = true;
+        erasePx += (hi == 0x0) + (lo == 0x0);
+      }
+      inkPx += (hiIn && curHi <= inkMax) + (loIn && curLo <= inkMax);
+    }
+  }
+  *anyEraseOut = anyErase;
+  *erasePxOut = erasePx;
+  if (inkPxOut) *inkPxOut = inkPx;
+  return temp;
+}
+
 void diffRefresh(int x, int y, int w, int h, uint8_t* prevBand,
                  const PersistRect* persist, int persistCount) {
   // FULL-SWAP flash-free update of the rect's row band — the workflow
@@ -250,14 +307,12 @@ void diffRefresh(int x, int y, int w, int h, uint8_t* prevBand,
   // Inside them nothing is re-driven — new ink is drawn in, and pixels
   // only erase if the content actually shrank. Everything else keeps the
   // validated full-swap behavior.
-  static constexpr uint8_t INK_MAX = 12;   // nibble <= this counts as ink
-  static constexpr int     ERASE_PASSES  = 1;   // x1 validated; x2+ rebounds
-  static constexpr int     ERASE_SETTLE_MS = 0; // gap-0 validated on hardware
-  static constexpr int     INK_PASSES   = 2;    // speed-lab-validated legibility
+  static constexpr int ERASE_PASSES    = 1;   // x1 validated; x2+ rebounds
+  static constexpr int ERASE_SETTLE_MS = 0;   // gap-0 validated on hardware
+  static constexpr int INK_PASSES      = 2;   // speed-lab-validated legibility
 
   int fullLineBytes = EPD_WIDTH / 2;
   bool usePersist = persist != nullptr && persistCount > 0;
-  int xEnd = x + w;
 
   // Fallback path: cleared refresh + prev update (always correct, flashes).
   auto fallbackCleared = [&]() {
@@ -269,45 +324,21 @@ void diffRefresh(int x, int y, int w, int h, uint8_t* prevBand,
     }
   };
 
-  uint8_t* temp = (uint8_t*)ps_malloc(fullLineBytes * h);
+  // Erase mask: ALL previous ink inside the rect's columns — except
+  // inside persistent rects, where only shrinking pixels (prev ink,
+  // now paper) are erased. Columns outside [x, x+w) stay no-drive.
+  // inkMax 12: this binary path's panel ink is thresholded ≤ 12 anyway
+  // (INK_MAX in inkRefresh), so no shade above 12 can be on the panel
+  // through it.
+  bool anyErase = false;
+  int erasePx = 0, inkPx = 0;
+  uint8_t* temp = buildEraseMask(x, y, w, h, prevBand, persist, persistCount, 12,
+                                 &anyErase, &erasePx, &inkPx);
   if (!temp) {
     fallbackCleared();
     return;
   }
-  // Default: no drive anywhere; only the rect's columns get computed.
-  memset(temp, 0xFF, (size_t)fullLineBytes * h);
-
-  // Erase mask: ALL previous ink inside the rect's columns — except
-  // inside persistent rects, where only shrinking pixels (prev ink,
-  // now paper) are erased. Columns outside [x, x+w) stay no-drive.
-  bool anyErase = false;
-  int erasePx = 0, inkPx = 0;
-  for (int row = 0; row < h; row++) {
-    const uint8_t* prev = prevBand + row * fullLineBytes;
-    const uint8_t* cur  = g_framebuffer + (y + row) * fullLineBytes;
-    uint8_t* out = temp + row * fullLineBytes;
-    int absY = y + row;
-    for (int b = x / 2; b <= (xEnd - 1) / 2; b++) {
-      uint8_t prevHi = prev[b] >> 4;
-      uint8_t prevLo = prev[b] & 0x0F;
-      uint8_t curHi  = cur[b] >> 4;
-      uint8_t curLo  = cur[b] & 0x0F;
-      bool hiIn = (b * 2 + 1 >= x) && (b * 2 + 1 < xEnd);
-      bool loIn = (b * 2 >= x) && (b * 2 < xEnd);
-      bool persistHi = usePersist && inAnyPersist(persist, persistCount, b * 2 + 1, absY);
-      bool persistLo = usePersist && inAnyPersist(persist, persistCount, b * 2, absY);
-      uint8_t hi = (hiIn && prevHi <= INK_MAX && (!persistHi || curHi > INK_MAX)) ? 0x0 : 0xF;
-      uint8_t lo = (loIn && prevLo <= INK_MAX && (!persistLo || curLo > INK_MAX)) ? 0x0 : 0xF;
-      out[b] = (hi << 4) | lo;
-      if (out[b] != 0xFF) {
-        anyErase = true;
-        erasePx += (hi == 0x0) + (lo == 0x0);
-      }
-      inkPx += (hiIn && curHi <= INK_MAX) + (loIn && curLo <= INK_MAX);
-    }
-  }
-  Serial.printf("[diff] y=%d h=%d: erase %d px (x1), ink %d px, %d persist rect(s)\n",
-                y, h, erasePx, inkPx, usePersist ? persistCount : 0);
+  unsigned long t0 = millis();   // total erase+ink duration, logged below
 
   // 1) Erase (one pass over the mask).
   if (anyErase) {
@@ -322,6 +353,9 @@ void diffRefresh(int x, int y, int w, int h, uint8_t* prevBand,
                   persist, persistCount)) {
     fallbackCleared();
   }
+
+  Serial.printf("[diff] y=%d h=%d: erase %d px (x1), ink %d px, %d persist rect(s), %lu ms\n",
+                y, h, erasePx, inkPx, usePersist ? persistCount : 0, millis() - t0);
 
   // prev = new, for the next differential update.
   for (int row = 0; row < h; row++) {
@@ -404,6 +438,82 @@ void DiffRegion::updateRows(int row, int count,
   int fullLineBytes = EPD_WIDTH / 2;
   diffRefresh(x, y + row, w, count, prev + (size_t)row * fullLineBytes,
               persist, persistCount);
+}
+
+void DiffRegion::updateGray() {
+  if (!prev) return;
+  int fullLineBytes = EPD_WIDTH / 2;
+
+  // Fallback path: cleared refresh + prev resync (always correct,
+  // flashes) — mirrors diffRefresh's fallbackCleared.
+  auto fallbackCleared = [&]() {
+    partialRefresh(0, y, EPD_WIDTH, h);
+    syncFromFb();
+  };
+
+  unsigned long t0 = millis();   // erase+draw duration, logged below
+
+  // 1) Erase ALL previous ink in the rect (any shade) — one white pass
+  //    over the same mask diffRefresh builds. No persistent rects here.
+  //    inkMax 14: the 4-bit draw (BLACK_ON_WHITE) drives ALL non-white
+  //    values, so shades 13/14 are real panel ink here — the erase must
+  //    treat all of them as ink or light-gray content would never be
+  //    erased. Pure paper (15) stays untouched per the never-drive-paper
+  //    rule.
+  bool anyErase = false;
+  int erasePx = 0;
+  uint8_t* mask = buildEraseMask(x, y, w, h, prev, nullptr, 0, 14,
+                                 &anyErase, &erasePx);
+  if (!mask) {
+    fallbackCleared();
+    return;
+  }
+  if (anyErase) whiteInkRefresh(y, h, mask, 1);
+  free(mask);
+
+  // 2) 4-bit draw of the new content. Full-width row buffer copied from
+  //    the framebuffer with columns OUTSIDE the rect whited out (0xFF =
+  //    no drive) so the draw touches only the rect's columns — the
+  //    driver's sub-width area path pads with white in a way that has
+  //    caused edge artifacts historically; full-width with whited-out
+  //    strips keeps the proven fast path and guarantees no drive
+  //    outside. Per row: memcpy the full fb line, then memset 0xFF over
+  //    bytes [0, x/2) and [(x+w+1)/2, fullLineBytes). If x or w is odd
+  //    the boundary byte keeps one fb nibble — accept it: that pixel
+  //    sits at the rect's edge and gets the fb value, which is a no-op
+  //    or a correct draw for a pixel the erase already treated as
+  //    in-rect (current callers are even-aligned).
+  uint8_t* temp = (uint8_t*)ps_malloc((size_t)fullLineBytes * h);
+  if (!temp) {
+    fallbackCleared();
+    return;
+  }
+  int leftBytes = x / 2;               // bytes fully left of the rect
+  int rightStart = (x + w + 1) / 2;    // first byte fully right of it
+  for (int row = 0; row < h; row++) {
+    uint8_t* line = temp + row * fullLineBytes;
+    memcpy(line, g_framebuffer + (y + row) * fullLineBytes, fullLineBytes);
+    memset(line, 0xFF, leftBytes);
+    memset(line + rightStart, 0xFF, fullLineBytes - rightStart);
+  }
+
+  // 3) True-gray draw: the rect was just erased to white, which is
+  //    exactly this path's from-white assumption.
+  Rect_t area;
+  area.x = 0;
+  area.y = y;
+  area.width = EPD_WIDTH;
+  area.height = h;
+  epd_poweron();
+  epd_draw_image(area, temp, BLACK_ON_WHITE);
+  epd_poweroff();
+  free(temp);
+
+  // 4) prev = new, for the next differential update.
+  syncFromFb();
+
+  Serial.printf("[graydiff] x=%d w=%d y=%d h=%d: erase %d px, %lu ms\n",
+                x, w, y, h, erasePx, millis() - t0);
 }
 
 uint8_t* framebuffer() { return g_framebuffer; }

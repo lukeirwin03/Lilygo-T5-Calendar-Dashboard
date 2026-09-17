@@ -24,6 +24,11 @@ static constexpr int ROW_COUNT = 6;
 static constexpr int CELL_X   = 250;   // test ink lands right of the labels
 static constexpr int CELL_W   = EPD_WIDTH - CELL_X - 10;
 
+// GRAY SWAP band: one full-width row band below the six rows — the
+// gray-capable full-swap (updateGray) calibration zone.
+static constexpr int GRAY_Y   = ROW_TOP + ROW_COUNT * ROW_H;
+static constexpr int GRAY_H   = ROW_H;
+
 static const char* const kRowLabels[ROW_COUNT] = {
   "ERASE x1", "DIFF SWAP", "GAP 0", "GAP 100", "GAP 250", "RAPID x2",
 };
@@ -157,6 +162,70 @@ static void speedSwap(int r, uint8_t* fb, uint8_t* mask, const char* word,
                 tInk - tGap, tInk - t0);
 }
 
+// --- GRAY SWAP phase --------------------------------------------------------
+// Calibration for the gray-capable full-swap (DiffRegion::updateGray):
+// one white-ink pass erases ALL previous ink (any shade) in the band,
+// then a true 4-bit draw renders the new frame — the 1-bit ink passes
+// of diffRefresh can't draw grays, this path can. Two alternating
+// gray-heavy frames swap 20×; judge shade fidelity, edge crispness,
+// ghosting and drift.
+
+// Shade fills in the 4-bit byte form other files use (e.g. ev.shade << 4).
+static constexpr uint8_t GRAY_5  = 5 << 4;
+static constexpr uint8_t GRAY_8  = 8 << 4;
+static constexpr uint8_t GRAY_12 = 12 << 4;
+static constexpr uint8_t GRAY_13 = 13 << 4;
+static constexpr uint8_t GRAY_14 = 14 << 4;
+
+// Text at a free position with an arbitrary fg shade nibble (the cell
+// helpers are cell-anchored; the gray band needs both).
+static void grayText(uint8_t* fb, const char* str, int x, int baseline,
+                     uint8_t fgNib) {
+  FontProperties props;
+  props.fg_color = fgNib;
+  props.bg_color = C_WHITE;
+  props.flags = 0;
+  props.fallback_glyph = 0;
+  int32_t tx = x, ty = baseline;
+  write_mode((GFXfont*)&MeltSwashes16, str, &tx, &ty, fb, BLACK_ON_WHITE, &props);
+}
+
+// Frame A: three shade blocks (5/8/12) side by side, black "GRAY A"
+// label, a mid-gray (8) text line, and a light-gray (14) block in the
+// bottom strip. `caption` adds the operator hint on the final frame only.
+static void drawGrayA(uint8_t* fb, bool caption) {
+  epd_fill_rect(0, GRAY_Y, EPD_WIDTH, GRAY_H, EPD_WHITE, fb);
+  epd_fill_rect(24,  GRAY_Y + 6, 70, 26, GRAY_5,  fb);
+  epd_fill_rect(104, GRAY_Y + 6, 70, 26, GRAY_8,  fb);
+  epd_fill_rect(184, GRAY_Y + 6, 70, 26, GRAY_12, fb);
+  epd_fill_rect(660, GRAY_Y + 44, 140, 16, GRAY_14, fb);
+  grayText(fb, "GRAY A", 320, GRAY_Y + 34, C_BLACK);
+  grayText(fb, "shade 8 line", 520, GRAY_Y + 34, 8);
+  if (caption) {
+    FontProperties props;
+    props.fg_color = C_BLACK; props.bg_color = C_WHITE;
+    props.flags = 0; props.fallback_glyph = 0;
+    int32_t x = 24, y = GRAY_Y + 56;
+    write_mode((GFXfont*)&MeltSwashes14,
+               "GRAY SWAP x20 — inspect: shade fidelity, ghost edges, drift",
+               &x, &y, fb, BLACK_ON_WHITE, &props);
+  }
+}
+
+// Frame B: different arrangement — label left, shade-8 + shade-12
+// blocks at new positions/widths (every swap erases AND draws gray).
+// The shade-13 block sits in the bottom strip at a new position/size,
+// PARTLY OVERLAPPING frame A's shade-14 block — every swap must erase
+// light-gray ink (13/14) to clean white where the frames disagree, or
+// it leaves exactly the residue this phase exists to catch.
+static void drawGrayB(uint8_t* fb) {
+  epd_fill_rect(0, GRAY_Y, EPD_WIDTH, GRAY_H, EPD_WHITE, fb);
+  grayText(fb, "GRAY B", 24, GRAY_Y + 34, C_BLACK);
+  epd_fill_rect(320, GRAY_Y + 6, 140, 26, GRAY_8,  fb);
+  epd_fill_rect(500, GRAY_Y + 6, 60,  26, GRAY_12, fb);
+  epd_fill_rect(720, GRAY_Y + 44, 90, 16, GRAY_13, fb);
+}
+
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
@@ -196,6 +265,10 @@ void run() {
   memcpy(s_prev, fb, (size_t)fullLineBytes * EPD_HEIGHT);
 
   uint8_t* mask = (uint8_t*)ps_malloc((size_t)fullLineBytes * ROW_H);
+
+  // Gray-swap phase's tracked region — kept across cycles so begin()
+  // stays idempotent (the prev record is reused, not reallocated).
+  display_mgr::DiffRegion grayRegion;
 
   int cycle = 1;
   bool exit = false;
@@ -252,6 +325,34 @@ void run() {
       Serial.printf("[difftest] rapid fire: 6 swaps in %lu ms (%lu ms avg)\n",
                     millis() - tStart, (millis() - tStart) / 6);
       exit = waitBtn(2000);
+    }
+
+    // --- 6) GRAY SWAP: the gray-capable full-swap (updateGray) on a
+    //        full-width band below the rows. Seed frame A with a cleared
+    //        partial, then 20 flash-free swaps alternating B/A — the
+    //        erase must clear gray ink of every shade, the 4-bit draw
+    //        must render it back faithfully. Ends on frame A + caption. ---
+    if (!exit && !grayRegion.begin(0, GRAY_Y, EPD_WIDTH, GRAY_H)) {
+      Serial.println("[difftest] gray swap: prev alloc failed — skipping");
+    } else if (!exit) {
+      Serial.printf("[difftest] cycle %d: gray swap (updateGray x20)\n", cycle);
+      drawGrayA(fb, false);
+      display_mgr::partialRefresh(0, GRAY_Y, EPD_WIDTH, GRAY_H);   // cleared seed
+      grayRegion.syncFromFb();
+      unsigned long grayTotal = 0;
+      for (int i = 1; i <= 20; i++) {
+        if (i & 1) drawGrayB(fb);                  // seeded with A → B, A, B, ...
+        else       drawGrayA(fb, i == 20);         // last swap leaves A + caption
+        unsigned long t0 = millis();
+        grayRegion.updateGray();
+        unsigned long dt = millis() - t0;
+        grayTotal += dt;
+        Serial.printf("[difftest] gray swap %d/20: %lu ms\n", i, dt);
+      }
+      Serial.printf("[difftest] gray swap: 20 swaps in %lu ms (%lu ms avg)\n",
+                    grayTotal, grayTotal / 20);
+      Serial.println("[difftest] gray swap done — judge: shades match the neighboring cleared rows, block edges crisp, no tint in the white gaps, text legible");
+      exit = waitBtn(4000);
     }
     cycle++;
   }

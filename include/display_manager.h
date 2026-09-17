@@ -89,6 +89,16 @@ namespace display_mgr {
     void updateRows(int row, int count,
                     const PersistRect* persist = nullptr, int persistCount = 0);
 
+    // Gray-capable flash-free update: ONE white-ink pass erases ALL previous
+    // ink (any shade) inside the rect, then the new content is drawn through
+    // the 4-bit path (true grays; white pixels get no drive; the rect is
+    // white after the erase, matching that path's from-white assumption).
+    // Use when the region's content contains gray shades. No persistent
+    // rects — the whole rect is swapped. Slower than update() and pending
+    // hardware validation of repeated cycles (gray drift): validate with
+    // the diff-test GRAY SWAP phase before trusting it in the UI.
+    void updateGray();
+
     uint8_t* prev = nullptr;  // full-width lines for rows [y, y+h)
   };
 
