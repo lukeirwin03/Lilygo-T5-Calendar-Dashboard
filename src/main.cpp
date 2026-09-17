@@ -6,6 +6,7 @@
 #include "diff_test.h"
 #include "ui.h"
 #include "ui_settings.h"
+#include "refresh_hygiene.h"
 #include "battery.h"
 #include "touch_input.h"
 #include "power_mgr.h"
@@ -217,9 +218,8 @@ static void handleTouch() {
       lastActivityMs = millis();
       Serial.printf("[touch] x=%d y=%d\n", x, y);
     } else {
-      // INT is LOW (touched=true) but GT911 returned no point data.
-      // This indicates a touch controller communication issue.
-      Serial.println("[touch] INT low but no point data");
+      // INT is LOW (touched=true) but GT911 returned no point data —
+      // poll() logs this edge-triggered (once per rest, not every poll).
       touched = false;
     }
   }
@@ -248,9 +248,12 @@ void setup() {
   pinMode(config::BUTTON_PIN, INPUT_PULLUP);
   lastButtonMs = millis();
 
-  // Calibration first: the differential-refresh test screen loops until
-  // the button is pressed, then the connection animation plays.
-  diff_test::run();
+  refresh_hygiene::begin();
+
+  // Calibration (opt-in via config::DIFF_TEST_AT_BOOT): the
+  // differential-refresh test screen loops until the button is pressed,
+  // then the connection animation plays.
+  if (config::DIFF_TEST_AT_BOOT) diff_test::run();
 
   // Photogenic boot: play the connection screen animation (skippable).
   demoConnectionAnimation();
@@ -264,38 +267,134 @@ void setup() {
   lastActivityMs = millis();
 }
 
+// Full cleared flash of a freshly rendered view — the mode-0 sequence.
+// Also the refresh-hygiene reset: pair every call with
+// refresh_hygiene::markFullFlash().
+static void fullFlashRender() {
+  display_mgr::powerOn();
+  epd_clear();
+  ui::render();
+  display_mgr::fullRefresh();
+  display_mgr::powerOff();
+}
+
 static void doRender() {
+  // Partial refresh modes 0..5:
+  //   0 full, 1 settings modal diff, 2 daily detail, 3 focus scroll,
+  //   4 settings close reflash, 5 gray view change.
+  // When GRAY_DIFF_ENABLED, modes 2/3/5 first check refresh_hygiene:
+  // if the flash-free credit cap or a time backstop was hit, the
+  // transition silently upgrades to a full cleared flash (paying down
+  // the accumulated diff debt) instead of another differential update.
+  // Modes 3 and 5 additionally ride cadences checked before the
+  // hygiene ledger: every SCROLL_FLASH_EVERY-th scroll reflashs the
+  // focus rows; every NAV_FLASH_EVERY-th day nav full-flashes.
   int mode = ui::refreshMode();
-  if (mode == 2) {  // REFRESH_PARTIAL_DAILY
-    ui::render();
-    int dx, dy, dw, dh;
-    ui::getDailyDirtyRect(dx, dy, dw, dh);
-    display_mgr::partialRefresh(dx, dy, dw, dh);
-    Serial.println("[demo] Partial refresh (daily)");
+  if (mode == 2) {  // REFRESH_PARTIAL_DAILY (detail open/back)
+    if (config::GRAY_DIFF_ENABLED && refresh_hygiene::wantsFlash()) {
+      fullFlashRender();
+      refresh_hygiene::markFullFlash();
+      Serial.println("[demo] Hygiene piggyback — full flash (daily detail)");
+    } else if (config::GRAY_DIFF_ENABLED) {
+      ui::render();
+      if (ui::pushDailyDetailGray()) {
+        refresh_hygiene::creditDiff();
+        Serial.println("[demo] Gray diff (daily detail)");
+      } else {
+        // Gray push failed (record alloc) — legacy cleared partial.
+        int dx, dy, dw, dh;
+        ui::getDailyDirtyRect(dx, dy, dw, dh);
+        display_mgr::partialRefresh(dx, dy, dw, dh);
+        Serial.println("[demo] Partial refresh (daily, fallback)");
+      }
+    } else {
+      ui::render();
+      int dx, dy, dw, dh;
+      ui::getDailyDirtyRect(dx, dy, dw, dh);
+      display_mgr::partialRefresh(dx, dy, dw, dh);
+      Serial.println("[demo] Partial refresh (daily)");
+    }
   } else if (mode == 1) {  // REFRESH_PARTIAL_SETTINGS (modal)
     ui::render();
-    if (!ui_settings::diffPush()) {
+    if (ui_settings::diffPush()) {
+      refresh_hygiene::creditDiff();
+    } else {
       int sx, sy, sw, sh;
       ui::getSettingsDirtyRect(sx, sy, sw, sh);
       display_mgr::partialRefresh(sx, sy, sw, sh);
     }
     Serial.println("[demo] Diff update (settings)");
-  } else if (mode == 3) {  // REFRESH_PARTIAL_FOCUS (timeline scroll, ghost)
-    ui::render();
-    int fx, fy, fw, fh;
-    ui::getFocusGhostRect(fx, fy, fw, fh);
-    display_mgr::ghostRefresh(fx, fy, fw, fh);
-    Serial.println("[demo] Ghost refresh (focus timeline)");
-  } else if (mode == 4) {  // REFRESH_SETTINGS_CLOSE (modal closing, cleared reflash)
+  } else if (mode == 3) {  // REFRESH_PARTIAL_FOCUS (timeline scroll)
+    if (config::GRAY_DIFF_ENABLED && ui::focusScrollFlashDue()) {
+      // Scroll cadence: every Nth scroll gets a cleared reflash of the
+      // focus rows (row-range semantics — full-width clear of those rows)
+      // instead of another gray diff. Scoped like the settings modal's
+      // close reflash; does NOT reset the global hygiene ledger.
+      ui::render();
+      int fx, fy, fw, fh;
+      ui::getFocusGhostRect(fx, fy, fw, fh);
+      display_mgr::partialRefresh(fx, fy, fw, fh);
+      Serial.println("[demo] Scroll cadence reflash (focus)");
+    } else if (config::GRAY_DIFF_ENABLED && refresh_hygiene::wantsFlash()) {
+      fullFlashRender();
+      refresh_hygiene::markFullFlash();
+      Serial.println("[demo] Hygiene piggyback — full flash (focus scroll)");
+    } else if (config::GRAY_DIFF_ENABLED) {
+      ui::render();
+      if (ui::pushFocusScrollGray()) {
+        refresh_hygiene::creditDiff();
+        Serial.println("[demo] Gray diff (focus scroll)");
+      } else {
+        // Gray push failed (record alloc) — legacy ghost push.
+        int fx, fy, fw, fh;
+        ui::getFocusGhostRect(fx, fy, fw, fh);
+        display_mgr::ghostRefresh(fx, fy, fw, fh);
+        refresh_hygiene::creditGhost();  // ghost pushes dirty the panel too
+        Serial.println("[demo] Ghost refresh (focus timeline, fallback)");
+      }
+    } else {
+      ui::render();
+      int fx, fy, fw, fh;
+      ui::getFocusGhostRect(fx, fy, fw, fh);
+      display_mgr::ghostRefresh(fx, fy, fw, fh);
+      refresh_hygiene::creditGhost();    // ghost pushes dirty the panel too
+      Serial.println("[demo] Ghost refresh (focus timeline)");
+    }
+  } else if (mode == 4) {  // REFRESH_SETTINGS_CLOSE (modal closing, band-local cleared reflash — no hygiene reset or credit)
     ui::render();
     ui_settings::closeReflash();
     Serial.println("[demo] Reflash (settings close)");
+  } else if (mode == 5) {  // REFRESH_GRAY (day nav; ui only sets this when GRAY_DIFF_ENABLED)
+    if (ui::navFlashDue()) {
+      // Nav cadence: every NAV_FLASH_EVERY-th day nav full-flashes — day
+      // navs are the heaviest gray diff in the app (~whole-screen erase
+      // per tap) and ghost fast. Resets the global hygiene ledger too.
+      fullFlashRender();
+      refresh_hygiene::markFullFlash();
+      Serial.println("[demo] Nav cadence — full flash (day nav)");
+    } else if (refresh_hygiene::wantsFlash()) {
+      fullFlashRender();
+      refresh_hygiene::markFullFlash();
+      Serial.println("[demo] Hygiene piggyback — full flash (day nav)");
+    } else {
+      ui::render();
+      if (ui::pushViewGray()) {
+        refresh_hygiene::creditDiff();
+        Serial.println("[demo] Gray diff (day nav)");
+      } else {
+        // Gray push failed (record alloc) — full flash fallback. The
+        // view is already rendered; just clear and push it.
+        display_mgr::powerOn();
+        epd_clear();
+        display_mgr::fullRefresh();
+        display_mgr::powerOff();
+        refresh_hygiene::markFullFlash();
+        Serial.println("[demo] Full refresh (day nav, fallback)");
+      }
+    }
   } else {
-    display_mgr::powerOn();
-    epd_clear();
-    ui::render();
-    display_mgr::fullRefresh();
-    display_mgr::powerOff();
+    fullFlashRender();
+    refresh_hygiene::markFullFlash();
     Serial.println("[demo] Rendered screen");
   }
 }

@@ -90,9 +90,11 @@ static bool       s_pendingRender = false;
 // no-clear ("ghost") push of the focus column used by timeline scrolling —
 // fast, but prior frames leave faint ghosts until the next full refresh.
 // SETTINGS_CLOSE pushes the restored view through the modal's flash-free
-// differential refresh (no full-screen flash on modal close).
+// differential refresh (no full-screen flash on modal close). GRAY is a
+// full-view change (day nav) pushed as a gray-capable differential
+// refresh of the whole screen.
 enum RefreshMode { REFRESH_FULL, REFRESH_PARTIAL_SETTINGS, REFRESH_PARTIAL_DAILY,
-                   REFRESH_PARTIAL_FOCUS, REFRESH_SETTINGS_CLOSE };
+                   REFRESH_PARTIAL_FOCUS, REFRESH_SETTINGS_CLOSE, REFRESH_GRAY };
 static RefreshMode s_refreshMode = REFRESH_FULL;
 
 // Focus-column (today only) sliding-window state. renderWeeklyView
@@ -833,20 +835,29 @@ static bool isInCooldown() {
 }
 
 static void triggerNav(int days) {
+  Serial.printf("[ui] day nav %+d\n", days);
   s_baseDayOffset = clampDayOffset(s_baseDayOffset + days);
   s_selectedEventIdx = -1;
   s_focusScrollOffsetMin = 0;   // manual focus scroll doesn't survive navigation
   s_pendingRender = true;
-  s_refreshMode = REFRESH_FULL;
+  // Day nav stays a silent gray diff (when enabled) — the content change
+  // is small (one day slides), so the flash-free swap reads fine, gated
+  // by the global hygiene cap. Unlike view switches (see
+  // triggerScreenChange), which flash every time.
+  s_refreshMode = config::GRAY_DIFF_ENABLED ? REFRESH_GRAY : REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
 }
 
 static void triggerScreenChange(Screen next, int dayOffset) {
+  Serial.printf("[ui] screen change -> %s\n", next == SCREEN_DAILY ? "daily" : "weekly");
   s_screen = next;
   s_baseDayOffset = clampDayOffset(dayOffset);
   s_selectedEventIdx = -1;
   s_focusScrollOffsetMin = 0;
   s_pendingRender = true;
+  // Hardware feedback: the whole-screen gray swap ghosted, and a view
+  // switch is a big content change anyway — flash every time (the flash
+  // reads as intentional). Day nav keeps the gray diff (triggerNav).
   s_refreshMode = REFRESH_FULL;
   s_cooldownUntilMs = millis() + GESTURE_COOLDOWN_MS;
 }
@@ -1167,6 +1178,120 @@ void getFocusGhostRect(int& x, int& y, int& w, int& h) {
   w = s_focusColW + 8;
   y = s_focusTop - 28;                        // include the top boundary label
   h = (EPD_HEIGHT - 4) - y;                   // through the bottom label
+}
+
+// --- Gray differential push helpers ----------------------------------------
+//
+// Each helper swaps freshly rendered content onto the panel with a
+// flash-free, gray-capable differential refresh (DiffRegion::updateGray:
+// one white-ink pass erases the previous ink, then a 4-bit draw renders
+// the new content with true grays). Call AFTER render() has drawn the
+// new view into the framebuffer; each returns false if the region's
+// prev-frame record couldn't be allocated — the caller falls back to a
+// legacy (flashing/cleared) refresh.
+//
+// updateGray's erase pass is masked by the region's prev record, which
+// must hold the ink PHYSICALLY on the panel — and at push time the
+// framebuffer already holds the NEW view. The record is therefore
+// seeded from a snapshot of the framebuffer taken just before render()
+// redrew it: after any completed render push the panel matches the
+// framebuffer, so the pre-render snapshot is always the panel content
+// and no further staleness tracking is needed. (Known exception: the
+// legacy ghost fallback leaves add-ink residue the snapshot can't know
+// about — same residue that path already accepts, cleaned by the next
+// full flash.)
+
+static uint8_t* s_preRenderFb = nullptr;   // framebuffer content == panel, captured in render()
+
+static void snapshotPanelFb() {
+  size_t bytes = (size_t)EPD_WIDTH * EPD_HEIGHT / 2;
+  if (!s_preRenderFb) s_preRenderFb = (uint8_t*)ps_malloc(bytes);
+  if (s_preRenderFb) memcpy(s_preRenderFb, display_mgr::framebuffer(), bytes);
+}
+
+// Seed `region`'s prev record from the pre-render snapshot (the panel
+// content). Returns false when the snapshot or record is unavailable.
+static bool seedRegionFromSnapshot(display_mgr::DiffRegion& region) {
+  if (!s_preRenderFb || !region.prev) return false;
+  int fullLineBytes = EPD_WIDTH / 2;
+  memcpy(region.prev, s_preRenderFb + (size_t)region.y * fullLineBytes,
+         (size_t)fullLineBytes * region.h);
+  return true;
+}
+
+bool pushViewGray() {
+  static display_mgr::DiffRegion region;
+  if (!region.begin(0, 0, EPD_WIDTH, EPD_HEIGHT)) return false;
+  if (!seedRegionFromSnapshot(region)) return false;
+  region.updateGray();
+  return true;
+}
+
+// Gray-diff the daily event-list rect (detail open / back to list).
+bool pushDailyDetailGray() {
+  static display_mgr::DiffRegion region;
+  int listX, listY, listW, listH;
+  getDailyListRect(listX, listY, listW, listH);
+  if (!region.begin(listX, listY, listW, listH)) return false;
+  if (!seedRegionFromSnapshot(region)) return false;
+  region.updateGray();
+  return true;
+}
+
+// Gray-diff the focus timeline column (scroll arrows) — the same rect
+// the ghost push covers (column ± 4 px, top boundary label through the
+// bottom of the screen).
+bool pushFocusScrollGray() {
+  static display_mgr::DiffRegion region;
+  int fx, fy, fw, fh;
+  getFocusGhostRect(fx, fy, fw, fh);
+  if (!region.begin(fx, fy, fw, fh)) return false;
+  if (!seedRegionFromSnapshot(region)) return false;
+  region.updateGray();
+  return true;
+}
+
+// Scroll-cadence bookkeeping: call once per focus-scroll render (mode 3,
+// GRAY_DIFF_ENABLED path). Counts scrolls since the last cleared reflash
+// of the focus column; returns true when the cadence is hit (and resets
+// the counter) — the caller should do a cleared reflash of the focus
+// rect instead of another gray diff. Not counted when gray diff is off
+// (legacy ghost behavior is unchanged).
+bool focusScrollFlashDue() {
+  static int scrollsSinceReflash = 0;
+  if (!config::GRAY_DIFF_ENABLED) return false;
+  if (config::SCROLL_FLASH_EVERY <= 0) return false;
+  scrollsSinceReflash++;
+  if (scrollsSinceReflash >= config::SCROLL_FLASH_EVERY) {
+    scrollsSinceReflash = 0;
+    Serial.printf("[ui] scroll cadence hit (%d/%d) — this render reflashs the focus rows\n",
+                  config::SCROLL_FLASH_EVERY, config::SCROLL_FLASH_EVERY);
+    return true;
+  }
+  Serial.printf("[ui] scroll %d/%d since last reflash\n",
+                scrollsSinceReflash, config::SCROLL_FLASH_EVERY);
+  return false;
+}
+
+// Day-nav cadence bookkeeping: call once per day-nav render (mode 5,
+// GRAY_DIFF_ENABLED path). Counts day navs since the last full flash;
+// returns true when the cadence is hit (and resets the counter) — the
+// caller should do a full cleared flash instead of another whole-screen
+// gray diff. Not counted when gray diff is off (mode 5 is unreachable
+// then, so the legacy behavior is unchanged).
+bool navFlashDue() {
+  static int navsSinceFlash = 0;
+  if (!config::GRAY_DIFF_ENABLED) return false;
+  if (config::NAV_FLASH_EVERY <= 0) return false;
+  navsSinceFlash++;
+  if (navsSinceFlash >= config::NAV_FLASH_EVERY) {
+    navsSinceFlash = 0;
+    Serial.printf("[ui] day nav cadence hit — this one full-flashes\n");
+    return true;
+  }
+  Serial.printf("[ui] day nav %d/%d since last flash\n",
+                navsSinceFlash, config::NAV_FLASH_EVERY);
+  return false;
 }
 
 // Lane assignment for an event in a column. `lane` is the index of the lane
@@ -2150,6 +2275,10 @@ static void renderDailyView() {
 // Public API
 // ---------------------------------------------------------------------------
 void render() {
+  // Capture what the panel currently shows (== framebuffer before this
+  // redraw) for the gray push helpers' prev records — see pushViewGray.
+  snapshotPanelFb();
+
   if (s_screen != SCREEN_SETTINGS && (s_events == nullptr || s_eventCount == 0)) {
     uint8_t* fb = display_mgr::framebuffer();
     memset(fb, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);

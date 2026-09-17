@@ -10,6 +10,12 @@ static TouchDrvGT911 touch;
 static bool online = false;
 static uint8_t address = 0;
 
+// Edge latch for the INT-low-but-no-point warning: INT stays low while
+// the finger rests after the point buffer drains, so the raw condition
+// holds for many consecutive polls. Log only on the transition from a
+// known-good point read, not every poll.
+static bool hadPointData = false;
+
 namespace touch_input {
 
 bool begin() {
@@ -60,11 +66,19 @@ bool poll(int16_t &x, int16_t &y) {
 
   uint8_t touched = touch.getPoint(&x, &y, 1);
   if (touched > 0) {
+    hadPointData = true;
     if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) {
       Serial.printf("[touch] Out of bounds: x=%d y=%d\n", x, y);
       return false;
     }
     return true;
+  }
+  // INT is LOW but the GT911 returned no point data — usually the finger
+  // resting after the buffer drained (a communication issue would persist
+  // across touches). Log the transition only.
+  if (hadPointData) {
+    Serial.println("[touch] INT low but no point data");
+    hadPointData = false;
   }
   return false;
 }

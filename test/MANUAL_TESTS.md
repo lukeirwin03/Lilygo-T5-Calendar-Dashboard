@@ -42,7 +42,7 @@ Run these on the actual device after flashing.
 - [ ] Navigating to non-today days shows the deterministic compact event window (no arrows, no now marker)
 
 ## Demo build — differential-refresh calibration screen
-- [ ] Runs at boot (before the connection animation); loops cycles until the button is pressed
+- [ ] No longer runs at boot by default (the engine is characterized) — set `DIFF_TEST_AT_BOOT = true` in config.h and reflash to run it; it then plays before the connection animation and loops cycles until the button is pressed
 - [ ] Every cycle starts with a clean reset of all cells (×1 masked erase + fresh base ink) — no text stacking at the base-word re-ink on any row
 - [ ] ERASE x1 / DIFF SWAP rows: quality references (single-pass erase; shipping full-swap timing)
 - [ ] GAP 0 / GAP 100 / GAP 250 rows: same swap with shrinking settle gaps — compare cleanliness against DIFF SWAP; serial reports each phase's measured duration
@@ -50,8 +50,18 @@ Run these on the actual device after flashing.
 - [ ] Serial log narrates and times every step (`[difftest]`, `[diff]`)
 - [ ] Connection screen: stage text erases fully with no offset ghosting (the 1-bit ink frames span the full panel height — sub-height frames land a row off from the 4-bit erase path)
 
+## GRAY SWAP calibration (diff_test)
+
+- [ ] Set `DIFF_TEST_AT_BOOT = true` in config.h and reflash — the calibration screen no longer runs at boot by default; the GRAY SWAP phase runs after the six quality/speed rows each cycle — a full-width gray-heavy band below the rows swaps frames A/B 20× via `DiffRegion::updateGray()` (white-ink erase + 4-bit draw), each swap timed on serial (`[difftest] gray swap N/20: … ms`, plus total/average)
+- [ ] Final frame: shade blocks 5/8/12 + black "GRAY A" + gray-8 text line + the "GRAY SWAP x20" caption — judge against the neighboring cleared rows
+- [ ] Shade fidelity: the 5/8/12 blocks should match a freshly-cleared reference render of those shades (no darkening/lightening)
+- [ ] Block edges crisp, no tint bleeding into the white gaps between blocks
+- [ ] Text legible (black and gray-8 lines); no ghost edges from the erased previous frame
+- [ ] Drift check over repeated cycles: shades should look the same on cycle N as on cycle 1
+- [ ] Record the typical per-swap ms from serial (this is the cost of a gray update vs. the binary `update()` swap)
+
 ## Demo build — photo walk-through
-- [ ] After the calibration screen, boot plays the connection-screen animation for two cycles (all-success, then one ending in the "No payload received" failure label); band updates are flash-free (differential refresh) and old stage text should erase to clean white; touch or button skips
+- [ ] Boot plays the connection-screen animation for two cycles (all-success, then one ending in the "No payload received" failure label) — right away now that the calibration screen is off by default, or after it if `DIFF_TEST_AT_BOOT = true`; band updates are flash-free (differential refresh) and old stage text should erase to clean white; touch or button skips
 - [ ] If the white-ink erase leaves faint residue or the erase/draw still smear together, tune in display_manager.cpp's diffRefresh: `ERASE_PASSES` (erase strength, try 4-5), `ERASE_SETTLE_MS` (settle time between erase and draw), `INK_PASSES`/`INK_TIME_US` (solidity of the new ink), and `INK_MAX` (what counts as ink); the cleared partialRefresh fallback is a one-line swap in conn_screen's drawBand
 - [ ] Simulated clock starts at 9:42 AM (serial: `[demo] Simulated clock: ...`)
 - [ ] At 9:42 the today column shows the sliding window with the now marker near the top and the ▲ scroll arrow (the 6:30 AM jog has scrolled off)
@@ -106,6 +116,18 @@ Run these on the actual device after flashing.
 - [ ] Switch tabs → tab content swaps; the strips, title bar and bottom bar are passed as persistent rects and stay untouched (their ink is never re-driven — watch for zero flicker there)
 - [ ] Close (button, Close X, or Save) → a brief cleared reflash of the modal's row range (rows 60..480): a localized flash there is expected and intentional — it resets the pixels and pulls fresh data; the strips reflash with it because the clear is full-width
 - [ ] Restyle check: selected rows render INVERTED (black fill, white label/value/">" glyph); active tab, ± triangles, Save/Sync buttons and the separator line are solid black — no grays anywhere in the modal (grays threshold to black under the 1-bit ink path)
+
+## Flash-free navigation & hygiene (gray diff)
+
+- [ ] Focus ▲/▼ scroll arrows: mostly silent gray diffs, but EVERY 3RD scroll does a cleared reflash of the focus rows (brief flash there is expected; ghosting must not survive past it; `SCROLL_FLASH_EVERY`) — watch for `Scroll cadence reflash (focus)` on serial
+- [ ] Weekly↔daily switch: full flash EVERY time (by design now — hardware feedback was that the whole-screen gray swap ghosted)
+- [ ] Day-nav arrows: mostly silent whole-screen gray diffs, but EVERY 3RD day nav full-flashes (`NAV_FLASH_EVERY` — day navs erase ~200k px per tap and ghost fastest) — watch for `[ui] day nav 2/3` then `[demo] Nav cadence — full flash (day nav)` on serial (`[render] …` on the dashboard build)
+- [ ] Daily detail open/close: still silent gray diffs; piggyback full flash when hygiene hits (~12 credits)
+- [ ] Settings modal: unchanged — silent (diff refresh; close is a localized cleared reflash of the modal's row range)
+- [ ] Serial shows a `[graydiff]` line per push and `[hygiene] +1 (diff) -> N credits (cap 12)` accumulating; after ~12 flash-free updates the next nav/detail/scroll silently upgrades to a full flash (watch for the `Hygiene piggyback — full flash` log line and a `[hygiene] full flash — credits reset`)
+- [ ] Wake-from-sleep renders still full-flash (credits reset, `[hygiene] full flash — credits reset` on boot render)
+- [ ] With `GRAY_DIFF_ENABLED = false` in config.h (rebuild), the legacy flashing/ghost behavior returns everywhere (scroll cadence included)
+- [ ] The gray swap itself is pending hardware validation — run the GRAY SWAP calibration section above (diff_test) before trusting repeated gray cycles
 
 ## Cache & dedup
 - [ ] Publish a payload including past events that are also in the day cache → each occurrence renders exactly once (no duplicates)

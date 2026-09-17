@@ -62,6 +62,41 @@ namespace config {
   constexpr const char* NTP_SERVER_1  = "pool.ntp.org";
   constexpr const char* NTP_SERVER_2  = "time.nist.gov";
 
+  // -- Display refresh --
+  // Gray differential refresh (white-ink erase + 4-bit draw) for the
+  // calendar views. Pending hardware validation of repeated cycles —
+  // run the diff_test GRAY SWAP phase. Set false to restore the legacy
+  // flashing/ghost behavior everywhere.
+  constexpr bool GRAY_DIFF_ENABLED = true;
+
+  // Run the diff-refresh calibration screen (diff_test) at demo boot,
+  // before the connection animation. The engine is already characterized,
+  // so this is off by default — flip to true when re-calibrating (e.g.
+  // re-checking GRAY SWAP drift after engine changes).
+  static constexpr bool DIFF_TEST_AT_BOOT = false;
+
+  // Refresh hygiene: flash-free updates earn "credits" (a proxy for
+  // accumulated charge/ghosting); when the cap is hit, the NEXT
+  // user-initiated transition silently upgrades to a full cleared flash
+  // (never spontaneously mid-interaction). Time backstops cover long
+  // interactive sessions and the sleep→wake-without-render pattern.
+  // Gray diffs earn credits like everything else but ghost more than
+  // binary ones, so the cap is deliberately tight; tune from serial
+  // observations.
+  constexpr int  HYGIENE_CREDIT_CAP  = 12;             // diff/ghost updates between full flashes
+
+  // scroll arrow updates between cleared reflushes of the focus column
+  // (gray-diff ghosting accumulates fast on repeated same-column swaps);
+  // 0 disables the cadence (gray diff every scroll)
+  constexpr int  SCROLL_FLASH_EVERY  = 3;
+
+  // Day-nav cadence: every Nth context-column day navigation gets a full
+  // cleared flash instead of another whole-screen gray diff — day navs
+  // erase ~200k px per tap and ghost fast (hardware observation). 0 = off.
+  static constexpr int NAV_FLASH_EVERY = 3;
+  constexpr unsigned long HYGIENE_SESSION_MS = 15UL * 60 * 1000;  // awake-session backstop
+  constexpr long HYGIENE_ABSOLUTE_S  = 24L * 3600;     // absolute (RTC-persisted) backstop
+
   // -- Diagnostics --
   constexpr unsigned long HEARTBEAT_MS = 30000;
 }
